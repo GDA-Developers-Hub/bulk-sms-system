@@ -10,7 +10,7 @@ from django.contrib.auth import authenticate
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 from .models import (
-    User, PhoneBook, Contact, SMSCampaign,
+    User, ContactGroup, Contact, SMSCampaign,
     SMSMessage, Payment, SMSTemplate, WebhookEndpoint
 )
 
@@ -421,11 +421,30 @@ class UserProfileUpdateSerializer(serializers.ModelSerializer):
         return instance
 
 
-class PhoneBookSerializer(serializers.ModelSerializer):
+class ContactGroupSerializer(serializers.ModelSerializer):
+    contact_count = serializers.SerializerMethodField()
+    
     class Meta:
-        model = PhoneBook
-        fields = ('id', 'name', 'metadata', 'created_at', 'updated_at')
-        read_only_fields = ('id', 'created_at', 'updated_at')
+        model = ContactGroup
+        fields = ('id', 'name', 'description', 'contact_count', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'created_at', 'updated_at', 'contact_count')
+    
+    def get_contact_count(self, obj):
+        return obj.contacts.count()
+    
+    def validate_name(self, value):
+        user = self.context['request'].user
+        
+        # If this is an update, exclude the current instance
+        instance = getattr(self, 'instance', None)
+        if instance:
+            query = ContactGroup.objects.filter(user=user, name=value).exclude(pk=instance.pk)
+        else:
+            query = ContactGroup.objects.filter(user=user, name=value)
+            
+        if query.exists():
+            raise serializers.ValidationError("You already have a group with this name.")
+        return value
     
     def create(self, validated_data):
         validated_data['user'] = self.context['request'].user
@@ -433,36 +452,190 @@ class PhoneBookSerializer(serializers.ModelSerializer):
 
 
 class ContactSerializer(serializers.ModelSerializer):
+    group_name = serializers.CharField(source='group.name', read_only=True)
+    
     class Meta:
         model = Contact
-        fields = ('id', 'phonebook', 'phone_number', 'metadata', 'created_at', 'updated_at')
-        read_only_fields = ('id', 'created_at', 'updated_at')
+        fields = ('id', 'name', 'phone_number', 'group', 'group_name', 'last_message_sent', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'last_message_sent', 'created_at', 'updated_at', 'group_name')
 
-    def validate_phonebook(self, value):
+    def validate_group(self, value):
         if value.user != self.context['request'].user:
-            raise serializers.ValidationError("You don't have permission to add contacts to this phonebook.")
+            raise serializers.ValidationError("You don't have permission to add contacts to this group.")
         return value
+    
+    def validate(self, data):
+        # Validate that phone_number is unique within this group
+        phone_number = data.get('phone_number')
+        group = data.get('group')
+        
+        # If this is an update, exclude the current instance
+        instance = getattr(self, 'instance', None)
+        
+        # Format phone number if needed
+        if phone_number and not phone_number.startswith('+'):
+            # Default to Kenya format if no country code
+            if phone_number.startswith('0'):
+                phone_number = f"+254{phone_number[1:]}"
+            else:
+                phone_number = f"+254{phone_number}"
+            
+            # Update the data with the formatted phone number
+            data['phone_number'] = phone_number
+        
+        if group and phone_number:
+            if instance:
+                # For update, exclude the current instance
+                query = Contact.objects.filter(group=group, phone_number=phone_number).exclude(pk=instance.pk)
+            else:
+                # For create
+                query = Contact.objects.filter(group=group, phone_number=phone_number)
+                
+            if query.exists():
+                raise serializers.ValidationError({
+                    "phone_number": f"A contact with this phone number already exists in the group '{group.name}'."
+                })
+        
+        return data
 
 
 class SMSCampaignSerializer(serializers.ModelSerializer):
+    groups = serializers.PrimaryKeyRelatedField(
+        queryset=ContactGroup.objects.all(),
+        many=True,
+        required=False
+    )
+    total_recipients = serializers.SerializerMethodField()
+    delivered_count = serializers.SerializerMethodField()
+    failed_count = serializers.SerializerMethodField()
+    estimated_cost = serializers.SerializerMethodField()
+    template_name = serializers.CharField(source='template.name', read_only=True)
+    
     class Meta:
         model = SMSCampaign
-        fields = ('id', 'name', 'message', 'sender_id', 'status', 'metadata', 'created_at', 'updated_at')
-        read_only_fields = ('id', 'created_at', 'updated_at')
+        fields = ('id', 'name', 'message', 'sender_id', 'type', 'status', 
+                  'groups', 'scheduled_time', 'completed_time', 'recipient_count', 
+                  'delivery_rate', 'template', 'template_name', 'total_recipients',
+                  'delivered_count', 'failed_count', 'estimated_cost',
+                  'metadata', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'completed_time', 'delivery_rate', 'recipient_count',
+                           'created_at', 'updated_at')
+    
+    def get_total_recipients(self, obj):
+        return obj.get_recipients_count()
+    
+    def get_delivered_count(self, obj):
+        return SMSMessage.objects.filter(campaign=obj, delivery_status='delivered').count()
+    
+    def get_failed_count(self, obj):
+        return SMSMessage.objects.filter(campaign=obj, delivery_status__in=['failed', 'rejected', 'expired']).count()
+    
+    def get_estimated_cost(self, obj):
+        return obj.calculate_estimated_cost()
+        
+    def validate_groups(self, groups):
+        user = self.context['request'].user
+        
+        # Validate that all groups belong to the current user
+        for group in groups:
+            if group.user != user:
+                raise serializers.ValidationError(f"You don't have permission to use the group: {group.name}")
+        
+        return groups
+    
+    def validate(self, data):
+        # Ensure scheduled campaigns have a scheduled_time
+        if data.get('status') == 'scheduled' and not data.get('scheduled_time'):
+            raise serializers.ValidationError({
+                "scheduled_time": "A scheduled time is required for scheduled campaigns."
+            })
+            
+        # Ensure scheduled_time is in the future
+        if data.get('scheduled_time') and data.get('scheduled_time') < timezone.now():
+            raise serializers.ValidationError({
+                "scheduled_time": "Scheduled time must be in the future."
+            })
+            
+        return data
 
     def create(self, validated_data):
+        groups = validated_data.pop('groups', [])
         validated_data['user'] = self.context['request'].user
-        return super().create(validated_data)
+        
+        campaign = super().create(validated_data)
+        
+        # Add the groups
+        if groups:
+            campaign.groups.set(groups)
+            
+            # Update recipient count
+            campaign.recipient_count = campaign.get_recipients_count()
+            campaign.save(update_fields=['recipient_count'])
+            
+        return campaign
+    
+    def update(self, instance, validated_data):
+        groups = validated_data.pop('groups', None)
+        
+        campaign = super().update(instance, validated_data)
+        
+        # Update groups if provided
+        if groups is not None:
+            campaign.groups.set(groups)
+            
+            # Update recipient count
+            campaign.recipient_count = campaign.get_recipients_count()
+            campaign.save(update_fields=['recipient_count'])
+            
+        return campaign
 
 
 class SMSMessageSerializer(serializers.ModelSerializer):
+    campaign_name = serializers.CharField(source='campaign.name', read_only=True)
+    contact_name = serializers.CharField(source='contact.name', read_only=True)
+    
     class Meta:
         model = SMSMessage
-        fields = ('id', 'campaign', 'recipient', 'content', 'status', 'metadata', 'created_at', 'updated_at')
-        read_only_fields = ('id', 'status', 'created_at', 'updated_at')
+        fields = ('id', 'campaign', 'campaign_name', 'contact', 'contact_name', 
+                  'recipient', 'content', 'status', 'delivery_status', 
+                  'delivery_time', 'message_id', 'segments', 'cost',
+                  'error_message', 'metadata', 'created_at', 'updated_at')
+        read_only_fields = ('id', 'delivery_status', 'delivery_time', 'message_id',
+                           'segments', 'cost', 'error_message', 'created_at', 'updated_at')
+
+    def validate_campaign(self, campaign):
+        if campaign and campaign.user != self.context['request'].user:
+            raise serializers.ValidationError("You don't have permission to use this campaign.")
+        return campaign
+    
+    def validate_contact(self, contact):
+        if contact and contact.group.user != self.context['request'].user:
+            raise serializers.ValidationError("You don't have permission to use this contact.")
+        return contact
+        
+    def validate(self, data):
+        # Format recipient phone number if needed
+        recipient = data.get('recipient')
+        if recipient and not recipient.startswith('+'):
+            # Default to Kenya format if no country code
+            if recipient.startswith('0'):
+                recipient = f"+254{recipient[1:]}"
+            else:
+                recipient = f"+254{recipient}"
+            
+            # Update the data with the formatted phone number
+            data['recipient'] = recipient
+            
+        return data
 
     def create(self, validated_data):
         validated_data['user'] = self.context['request'].user
+        
+        # If a contact was provided, use its phone number as recipient if not specified
+        contact = validated_data.get('contact')
+        if contact and not validated_data.get('recipient'):
+            validated_data['recipient'] = contact.phone_number
+            
         return super().create(validated_data)
 
 

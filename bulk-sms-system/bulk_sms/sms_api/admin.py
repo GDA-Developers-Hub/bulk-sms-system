@@ -3,7 +3,7 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from .models import (
-    User, PhoneBook, Contact, SMSCampaign, 
+    User, ContactGroup, Contact, SMSCampaign, 
     SMSMessage, Payment, SMSTemplate, WebhookEndpoint
 )
 
@@ -15,16 +15,22 @@ class UserAdmin(BaseUserAdmin):
     )
 
 
-@admin.register(PhoneBook)
-class PhoneBookAdmin(admin.ModelAdmin):
-    list_display = ('name', 'user', 'created_at')
-    search_fields = ('name', 'user__username')
+@admin.register(ContactGroup)
+class ContactGroupAdmin(admin.ModelAdmin):
+    list_display = ('name', 'user', 'description', 'contact_count', 'created_at')
+    search_fields = ('name', 'description', 'user__username')
+    list_filter = ('created_at',)
+    
+    def contact_count(self, obj):
+        return obj.contacts.count()
+    contact_count.short_description = 'Number of Contacts'
 
 
 @admin.register(Contact)
 class ContactAdmin(admin.ModelAdmin):
-    list_display = ('phone_number', 'phonebook', 'created_at')
-    search_fields = ('phone_number', 'phonebook__name', 'phonebook__user__username')
+    list_display = ('name', 'phone_number', 'group', 'last_message_sent', 'created_at')
+    search_fields = ('name', 'phone_number', 'group__name', 'group__user__username')
+    list_filter = ('group', 'created_at', 'last_message_sent')
 
 
 @admin.register(SMSCampaign)
@@ -50,7 +56,8 @@ class PaymentAdmin(admin.ModelAdmin):
 
 @admin.register(SMSTemplate)
 class SMSTemplateAdmin(admin.ModelAdmin):
-    list_display = ('name', 'user', 'created_at')
+    list_display = ('name', 'user', 'category', 'last_used', 'created_at')
+    list_filter = ('category',)
     search_fields = ('name', 'content', 'user__username')
 
 

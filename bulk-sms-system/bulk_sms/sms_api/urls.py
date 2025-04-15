@@ -5,7 +5,7 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
     RegisterView, EmailVerificationRequestView, EmailVerificationConfirmView, UserViewSet, 
-    PhoneBookViewSet, ContactViewSet, SMSCampaignViewSet,
+    ContactGroupViewSet, ContactViewSet, SMSCampaignViewSet,
     SMSMessageViewSet, PaymentViewSet, SMSTemplateViewSet, WebhookEndpointViewSet,
     CustomTokenObtainPairView, RegisterView, LoginView, LogoutView, ChangePasswordView, 
     ResetPasswordRequestView, ResetPasswordConfirmView, UserProfileView
@@ -14,7 +14,7 @@ from .views import (
 # Set up the router for ViewSets
 router = DefaultRouter()
 router.register(r'users', UserViewSet)
-router.register(r'phonebooks', PhoneBookViewSet, basename='phonebook')
+router.register(r'groups', ContactGroupViewSet, basename='group')
 router.register(r'contacts', ContactViewSet, basename='contact')
 router.register(r'campaigns', SMSCampaignViewSet, basename='campaign')
 router.register(r'messages', SMSMessageViewSet, basename='message')

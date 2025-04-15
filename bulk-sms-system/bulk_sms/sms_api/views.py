@@ -19,7 +19,7 @@ from rest_framework_simplejwt.tokens import AccessToken
 from datetime import timedelta
 from django.utils import timezone
 import logging
-from .models import SMSTemplate
+from .models import SMSTemplate, ContactGroup, Contact
 from utils.sms_gateways import (
     validate_african_phone, generate_verification_token, 
     is_token_valid, send_verification_email, format_phone_number, 
@@ -29,7 +29,7 @@ from .serializers import (
     CustomTokenObtainPairSerializer, RegistrationSerializer, EmailVerificationRequestSerializer, 
     EmailVerificationConfirmSerializer, UserSerializer, TokenRefreshSerializer,
     ChangePasswordSerializer, ResetPasswordRequestSerializer, ResetPasswordConfirmSerializer,
-    UserProfileUpdateSerializer, PhoneBookSerializer, ContactSerializer, 
+    UserProfileUpdateSerializer, ContactGroupSerializer, ContactSerializer, 
     SMSCampaignSerializer, PaymentSerializer, SMSTemplateSerializer,
     WebhookEndpointSerializer, SMSMessageSerializer, LoginSerializer
 )
@@ -865,48 +865,76 @@ class UserViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
 
 
-class PhoneBookViewSet(viewsets.ModelViewSet):
+class ContactGroupViewSet(viewsets.ModelViewSet):
     """
-    API endpoint that allows phone books to be viewed or edited.
+    API endpoint that allows contact groups to be viewed or edited.
     """
-    serializer_class = PhoneBookSerializer
+    serializer_class = ContactGroupSerializer
     permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['name', 'description']
+    ordering_fields = ['name', 'created_at', 'updated_at']
+    ordering = ['name']
 
     def get_queryset(self):
         """
-        This view returns phone books for the currently authenticated user.
+        This view returns contact groups for the currently authenticated user.
         """
-        return PhoneBook.objects.filter(user=self.request.user)
+        return ContactGroup.objects.filter(user=self.request.user)
 
     @swagger_auto_schema(
-        operation_description="List all phonebooks belonging to the authenticated user"
+        operation_description="List all contact groups belonging to the authenticated user"
     )
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
 
     @swagger_auto_schema(
-        operation_description="Create a new phonebook"
+        operation_description="Create a new contact group"
     )
     def create(self, request, *args, **kwargs):
         return super().create(request, *args, **kwargs)
 
     @swagger_auto_schema(
-        operation_description="Retrieve a specific phonebook by ID"
+        operation_description="Retrieve a specific contact group by ID"
     )
     def retrieve(self, request, *args, **kwargs):
         return super().retrieve(request, *args, **kwargs)
 
     @swagger_auto_schema(
-        operation_description="Update a specific phonebook"
+        operation_description="Update a specific contact group"
     )
     def update(self, request, *args, **kwargs):
         return super().update(request, *args, **kwargs)
 
     @swagger_auto_schema(
-        operation_description="Delete a specific phonebook"
+        operation_description="Delete a specific contact group"
     )
     def destroy(self, request, *args, **kwargs):
         return super().destroy(request, *args, **kwargs)
+        
+    @action(detail=True, methods=['get'])
+    def contacts(self, request, pk=None):
+        """
+        List all contacts in a specific group
+        """
+        group = self.get_object()
+        contacts = Contact.objects.filter(group=group)
+        serializer = ContactSerializer(contacts, many=True, context={'request': request})
+        return Response(serializer.data)
+    
+    @swagger_auto_schema(
+        operation_description="Create a new contact group"
+    )
+    @action(detail=False, methods=['post'], url_path='new-group')
+    def new_group(self, request):
+        """
+        Create a new contact group with validation
+        """
+        serializer = self.get_serializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save(user=request.user)
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 class ContactViewSet(viewsets.ModelViewSet):
@@ -915,21 +943,33 @@ class ContactViewSet(viewsets.ModelViewSet):
     """
     serializer_class = ContactSerializer
     permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['name', 'phone_number']
+    ordering_fields = ['name', 'phone_number', 'created_at', 'last_message_sent']
+    ordering = ['name']
 
     def get_queryset(self):
         """
-        This view returns contacts in phonebooks owned by the currently authenticated user.
+        This view returns contacts in groups owned by the currently authenticated user.
+        Filter by group if provided in query params.
         """
-        return Contact.objects.filter(phonebook__user=self.request.user)
+        queryset = Contact.objects.filter(group__user=self.request.user)
+        
+        # Filter by group if provided
+        group_id = self.request.query_params.get('group')
+        if group_id:
+            queryset = queryset.filter(group_id=group_id)
+            
+        return queryset
 
     @swagger_auto_schema(
-        operation_description="List all contacts in user's phonebooks"
+        operation_description="List all contacts in user's groups"
     )
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
 
     @swagger_auto_schema(
-        operation_description="Create a new contact in one of user's phonebooks"
+        operation_description="Create a new contact in one of user's groups"
     )
     def create(self, request, *args, **kwargs):
         return super().create(request, *args, **kwargs)
@@ -951,20 +991,124 @@ class ContactViewSet(viewsets.ModelViewSet):
     )
     def destroy(self, request, *args, **kwargs):
         return super().destroy(request, *args, **kwargs)
+        
+    @swagger_auto_schema(
+        operation_description="Import contacts in bulk"
+    )
+    @action(detail=False, methods=['post'])
+    def import_contacts(self, request):
+        """
+        Import multiple contacts at once
+        """
+        group_id = request.data.get('group')
+        contacts_data = request.data.get('contacts', [])
+        
+        if not group_id:
+            return Response({"error": "Group ID is required"}, status=status.HTTP_400_BAD_REQUEST)
+            
+        try:
+            group = ContactGroup.objects.get(id=group_id, user=request.user)
+        except ContactGroup.DoesNotExist:
+            return Response({"error": "Group not found"}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Process each contact
+        created_contacts = []
+        errors = []
+        
+        for i, contact_data in enumerate(contacts_data):
+            # Add group to each contact
+            contact_data['group'] = group_id
+            
+            # Validate and create the contact
+            serializer = self.get_serializer(data=contact_data)
+            if serializer.is_valid():
+                contact = serializer.save()
+                created_contacts.append(serializer.data)
+            else:
+                # Add the index of the failed contact for reference
+                errors.append({
+                    "index": i,
+                    "data": contact_data,
+                    "errors": serializer.errors
+                })
+        
+        return Response({
+            "created": len(created_contacts),
+            "failed": len(errors),
+            "contacts": created_contacts,
+            "errors": errors
+        })
+    
+    @swagger_auto_schema(
+        operation_description="Export contacts from a group"
+    )
+    @action(detail=False, methods=['get'])
+    def export(self, request):
+        """
+        Export contacts from a group
+        """
+        group_id = request.query_params.get('group')
+        if not group_id:
+            return Response({"error": "Group ID is required"}, status=status.HTTP_400_BAD_REQUEST)
+            
+        try:
+            group = ContactGroup.objects.get(id=group_id, user=request.user)
+        except ContactGroup.DoesNotExist:
+            return Response({"error": "Group not found"}, status=status.HTTP_404_NOT_FOUND)
+            
+        contacts = Contact.objects.filter(group=group)
+        serializer = self.get_serializer(contacts, many=True)
+        
+        return Response({
+            "group": group.name,
+            "count": contacts.count(),
+            "contacts": serializer.data
+        })
+        
+    @swagger_auto_schema(
+        operation_description="Add a new contact"
+    )
+    @action(detail=False, methods=['post'])
+    def add_contact(self, request):
+        """
+        Add a new contact with validation
+        """
+        serializer = self.get_serializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 class SMSCampaignViewSet(viewsets.ModelViewSet):
     """
-    API endpoint that allows SMS campaigns to be viewed or edited.
+    API endpoint that allows SMS campaigns to be created, viewed, edited, and sent.
     """
     serializer_class = SMSCampaignSerializer
     permission_classes = [permissions.IsAuthenticated]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ['name', 'message', 'sender_id', 'status']
+    ordering_fields = ['name', 'created_at', 'updated_at', 'scheduled_time', 'status']
+    ordering = ['-created_at']
 
     def get_queryset(self):
         """
         This view returns campaigns for the currently authenticated user.
+        Filter by status if provided in query params.
         """
-        return SMSCampaign.objects.filter(user=self.request.user)
+        queryset = SMSCampaign.objects.filter(user=self.request.user)
+        
+        # Filter by status if provided
+        status = self.request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
+            
+        # Filter by type if provided
+        campaign_type = self.request.query_params.get('type')
+        if campaign_type:
+            queryset = queryset.filter(type=campaign_type)
+            
+        return queryset
 
     @swagger_auto_schema(
         operation_description="List all SMS campaigns belonging to the authenticated user"
@@ -977,22 +1121,43 @@ class SMSCampaignViewSet(viewsets.ModelViewSet):
     )
     def create(self, request, *args, **kwargs):
         return super().create(request, *args, **kwargs)
-
+    
     @swagger_auto_schema(
-        operation_description="Send an SMS campaign",
-        responses={
-            200: openapi.Response(
-                description="Campaign sending initiated",
-                schema=openapi.Schema(
-                    type=openapi.TYPE_OBJECT,
-                    properties={
-                        'status': openapi.Schema(type=openapi.TYPE_STRING),
-                    }
-                )
-            ),
-            400: "Campaign not in draft status"
-        }
+        operation_description="Retrieve a specific SMS campaign by ID"
     )
+    def retrieve(self, request, *args, **kwargs):
+        return super().retrieve(request, *args, **kwargs)
+    
+    @swagger_auto_schema(
+        operation_description="Update a specific SMS campaign"
+    )
+    def update(self, request, *args, **kwargs):
+        campaign = self.get_object()
+        
+        # Don't allow updates if campaign is not in draft status
+        if campaign.status not in ['draft', 'scheduled']:
+            return Response(
+                {"error": f"Cannot update campaign in '{campaign.status}' status. Only draft or scheduled campaigns can be updated."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        return super().update(request, *args, **kwargs)
+    
+    @swagger_auto_schema(
+        operation_description="Delete a specific SMS campaign"
+    )
+    def destroy(self, request, *args, **kwargs):
+        campaign = self.get_object()
+        
+        # Don't allow deletion if campaign is sending or processing
+        if campaign.status in ['sending', 'processing']:
+            return Response(
+                {"error": f"Cannot delete campaign in '{campaign.status}' status."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        return super().destroy(request, *args, **kwargs)
+
     @action(detail=True, methods=['post'])
     def send(self, request, pk=None):
         """
@@ -1011,6 +1176,249 @@ class SMSCampaignViewSet(viewsets.ModelViewSet):
         campaign.save()
         
         return Response({"status": "Campaign sending initiated"})
+        
+    @swagger_auto_schema(
+        operation_description="Cancel a scheduled SMS campaign",
+        responses={
+            200: openapi.Response(
+                description="Campaign cancelled successfully",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'status': openapi.Schema(type=openapi.TYPE_STRING),
+                        'message': openapi.Schema(type=openapi.TYPE_STRING),
+                    }
+                )
+            ),
+            400: "Campaign not in scheduled status"
+        }
+    )
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """
+        Cancel a scheduled campaign
+        """
+        campaign = self.get_object()
+        
+        if campaign.status != 'scheduled':
+            return Response(
+                {"error": "Only scheduled campaigns can be cancelled"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+            
+        campaign.status = 'cancelled'
+        campaign.save()
+        
+        return Response({
+            "status": "success",
+            "message": "Campaign cancelled successfully"
+        })
+    
+    @swagger_auto_schema(
+        operation_description="Get statistics for a specific campaign",
+        responses={
+            200: openapi.Response(
+                description="Campaign statistics",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'campaign_id': openapi.Schema(type=openapi.TYPE_STRING),
+                        'campaign_name': openapi.Schema(type=openapi.TYPE_STRING),
+                        'status': openapi.Schema(type=openapi.TYPE_STRING),
+                        'total_recipients': openapi.Schema(type=openapi.TYPE_INTEGER),
+                        'messages': openapi.Schema(
+                            type=openapi.TYPE_OBJECT,
+                            properties={
+                                'total': openapi.Schema(type=openapi.TYPE_INTEGER),
+                                'queued': openapi.Schema(type=openapi.TYPE_INTEGER),
+                                'sent': openapi.Schema(type=openapi.TYPE_INTEGER),
+                                'delivered': openapi.Schema(type=openapi.TYPE_INTEGER),
+                                'failed': openapi.Schema(type=openapi.TYPE_INTEGER),
+                            }
+                        ),
+                        'delivery_rate': openapi.Schema(type=openapi.TYPE_NUMBER),
+                    }
+                )
+            )
+        }
+    )
+    @action(detail=True, methods=['get'])
+    def stats(self, request, pk=None):
+        """
+        Get statistics for a campaign
+        """
+        campaign = self.get_object()
+        
+        # Get message statistics
+        messages = SMSMessage.objects.filter(campaign=campaign)
+        total_messages = messages.count()
+        
+        delivered = messages.filter(delivery_status='delivered').count()
+        failed = messages.filter(delivery_status__in=['failed', 'rejected', 'expired']).count()
+        queued = messages.filter(status='queued').count()
+        sent = messages.filter(status='sent').count()
+        
+        # Calculate delivery rate
+        delivery_rate = (delivered / total_messages * 100) if total_messages > 0 else 0
+        
+        return Response({
+            'campaign_id': str(campaign.id),
+            'campaign_name': campaign.name,
+            'status': campaign.status,
+            'total_recipients': campaign.recipient_count,
+            'messages': {
+                'total': total_messages,
+                'queued': queued,
+                'sent': sent,
+                'delivered': delivered,
+                'failed': failed,
+            },
+            'delivery_rate': round(delivery_rate, 2),
+            'created_at': campaign.created_at,
+            'updated_at': campaign.updated_at,
+            'completed_at': campaign.completed_time,
+        })
+    
+    @swagger_auto_schema(
+        operation_description="Get message details for a specific campaign",
+        responses={
+            200: openapi.Response(
+                description="Campaign message details",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'campaign_id': openapi.Schema(type=openapi.TYPE_STRING),
+                        'campaign_name': openapi.Schema(type=openapi.TYPE_STRING),
+                        'messages': openapi.Schema(
+                            type=openapi.TYPE_ARRAY,
+                            items=openapi.Schema(
+                                type=openapi.TYPE_OBJECT,
+                                properties={
+                                    'id': openapi.Schema(type=openapi.TYPE_STRING),
+                                    'recipient': openapi.Schema(type=openapi.TYPE_STRING),
+                                    'status': openapi.Schema(type=openapi.TYPE_STRING),
+                                    'delivery_status': openapi.Schema(type=openapi.TYPE_STRING),
+                                }
+                            )
+                        ),
+                        'count': openapi.Schema(type=openapi.TYPE_INTEGER),
+                    }
+                )
+            )
+        }
+    )
+    @action(detail=True, methods=['get'])
+    def messages(self, request, pk=None):
+        """
+        Get messages for a campaign
+        """
+        campaign = self.get_object()
+        
+        # Get all messages for this campaign
+        messages = SMSMessage.objects.filter(campaign=campaign)
+        
+        # Paginate if needed
+        page = self.paginate_queryset(messages)
+        if page is not None:
+            serializer = SMSMessageSerializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+            
+        serializer = SMSMessageSerializer(messages, many=True)
+        
+        return Response({
+            'campaign_id': str(campaign.id),
+            'campaign_name': campaign.name,
+            'messages': serializer.data,
+            'count': messages.count(),
+        })
+    
+    @swagger_auto_schema(
+        operation_description="Clone an existing campaign to create a new draft",
+        responses={
+            201: SMSCampaignSerializer,
+            400: "Bad request"
+        }
+    )
+    @action(detail=True, methods=['post'])
+    def clone(self, request, pk=None):
+        """
+        Clone a campaign to create a new draft
+        """
+        original = self.get_object()
+        
+        # Create a new campaign with the same data
+        new_campaign = SMSCampaign.objects.create(
+            user=request.user,
+            name=f"Copy of {original.name}",
+            message=original.message,
+            sender_id=original.sender_id,
+            type=original.type,
+            status='draft',  # Always create as draft
+            template=original.template,
+        )
+        
+        # Clone the groups
+        for group in original.groups.all():
+            new_campaign.groups.add(group)
+            
+        # Update recipient count
+        new_campaign.recipient_count = new_campaign.get_recipients_count()
+        new_campaign.save()
+        
+        serializer = self.get_serializer(new_campaign)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+    
+    @swagger_auto_schema(
+        operation_description="Get campaign types",
+        responses={
+            200: openapi.Response(
+                description="Campaign types",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_ARRAY,
+                    items=openapi.Schema(
+                        type=openapi.TYPE_OBJECT,
+                        properties={
+                            'value': openapi.Schema(type=openapi.TYPE_STRING),
+                            'label': openapi.Schema(type=openapi.TYPE_STRING),
+                        }
+                    )
+                )
+            )
+        }
+    )
+    @action(detail=False, methods=['get'])
+    def types(self, request):
+        """
+        Get campaign types
+        """
+        types = [{"value": key, "label": value} for key, value in SMSCampaign.TYPE_CHOICES]
+        return Response(types)
+    
+    @swagger_auto_schema(
+        operation_description="Get campaign statuses",
+        responses={
+            200: openapi.Response(
+                description="Campaign statuses",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_ARRAY,
+                    items=openapi.Schema(
+                        type=openapi.TYPE_OBJECT,
+                        properties={
+                            'value': openapi.Schema(type=openapi.TYPE_STRING),
+                            'label': openapi.Schema(type=openapi.TYPE_STRING),
+                        }
+                    )
+                )
+            )
+        }
+    )
+    @action(detail=False, methods=['get'])
+    def statuses(self, request):
+        """
+        Get campaign statuses
+        """
+        statuses = [{"value": key, "label": value} for key, value in SMSCampaign.STATUS_CHOICES]
+        return Response(statuses)
 
 
 class SMSMessageViewSet(viewsets.ModelViewSet):
