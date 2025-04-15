@@ -13,6 +13,7 @@ Go Digital Africa Bulk SMS Platform is a comprehensive solution for businesses t
 - **Authentication**: JWT-based authentication
 - **Database**: PostgreSQL for primary data storage
 - **Caching**: Redis
+- **WebSockets**: Django Channels for real-time features
 
 ### Frontend
 - **Framework**: React
@@ -47,19 +48,18 @@ Go Digital Africa Bulk SMS Platform is a comprehensive solution for businesses t
    - Campaign performance metrics
    - Usage reporting
 
-### Additional Backend Services (Node.js - *Future Implementation*)
-1. **Payment & Subscription System**
-   - M-Pesa integration
+5. **Payment & Subscription System**
+   - M-Pesa integration using Daraja API
    - Subscription management and billing
-   - Token tracking
+   - Token management and tracking
 
-2. **Webhook & API Gateway**
-   - Client webhook configuration
-   - API gateway for third-party integrations
+6. **Webhook & API Gateway**
+   - Client webhook configuration and delivery
+   - API endpoints for third-party integrations
    - Real-time event handling
 
-3. **Real-time Chat Interface Backend**
-   - WebSocket server for two-way messaging
+7. **Real-time Chat Interface Backend**
+   - Django Channels for WebSocket communication
    - Message history and threading
    - Notification system
 
@@ -92,10 +92,10 @@ Go Digital Africa Bulk SMS Platform is a comprehensive solution for businesses t
 
 ### Prerequisites
 - Python 3.9+
-- Node.js 16+
 - PostgreSQL 13+
 - Redis
 - Virtual environment tool (virtualenv or conda)
+- Node.js 16+ (for frontend only)
 
 ### Backend Setup (Django)
 
@@ -171,8 +171,12 @@ go-digital-africa-sms/
 │   ├── messaging/            # Core SMS functionality
 │   ├── contacts/             # Contact management
 │   ├── subscriptions/        # Subscription and billing
+│   ├── payments/             # Payment processing and M-Pesa integration
 │   ├── analytics/            # Reporting and metrics
-│   ├── integrations/         # Third-party integrations
+│   ├── webhooks/             # Webhook configuration and handling
+│   ├── realtime/             # Django Channels for WebSockets
+│   ├── templates/            # Django templates (admin customization)
+│   ├── static/               # Static files
 │   ├── manage.py             # Django management script
 │   └── requirements.txt      # Python dependencies
 │
@@ -207,6 +211,7 @@ The API documentation is available at `/api/docs/` when running the development 
 - Campaign scheduling and management
 - Delivery tracking and reporting
 - Two-way messaging capabilities
+- Real-time chat interface using WebSockets
 
 ### Subscription Tiers
 1. **Basic** (Small businesses, startups)
@@ -248,6 +253,14 @@ The API documentation is available at `/api/docs/` when running the development 
 - **JavaScript**: Use ESLint with Airbnb configuration
 - **React**: Follow component-based architecture with functional components and hooks
 
+### Django-Specific Guidelines
+- Use Django apps to modularize functionality
+- Write reusable Django management commands for recurring tasks
+- Implement Django signals for event-driven behavior
+- Create custom middleware when needed
+- Follow Django's ORM best practices
+- Write unit tests for models, views, and serializers
+
 ### Git Workflow
 1. Create feature branches from `develop` branch
 2. Use descriptive branch names: `feature/feature-name`, `bugfix/issue-description`
@@ -266,6 +279,7 @@ The API documentation is available at `/api/docs/` when running the development 
 - Containerized deployment with Docker and Docker Compose
 - NGINX as reverse proxy and static file server
 - Gunicorn as WSGI application server
+- Daphne for ASGI/WebSocket support
 - SSL/TLS certification (Let's Encrypt recommended)
 - Database backups and failover strategy
 
@@ -282,10 +296,21 @@ The API documentation is available at `/api/docs/` when running the development 
    python manage.py collectstatic
    ```
 
-3. Deploy using Docker Compose
+3. Run database migrations
+   ```bash
+   python manage.py migrate
+   ```
+
+4. Deploy using Docker Compose
    ```bash
    docker-compose -f docker-compose.prod.yml up -d
    ```
+
+### Scaling Considerations
+- Use Redis for caching frequently accessed data
+- Implement celery for background task processing
+- Consider database read replicas for heavy query loads
+- Use load balancing for horizontally scaling web servers
 
 ## License
 This project is proprietary and confidential. Unauthorized copying, distribution, or use is strictly prohibited.
