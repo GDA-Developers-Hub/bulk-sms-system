@@ -207,6 +207,10 @@ LOGGING = {
     },
 }
 
+LOG_DIR = os.path.join(BASE_DIR, 'logs')
+os.makedirs(LOG_DIR, exist_ok=True)
+
+
 ROOT_URLCONF = 'bulk_sms.urls'
 
 TEMPLATES = [
