@@ -272,7 +272,7 @@ WSGI_APPLICATION = 'bulk_sms.wsgi.application'
 
 DATABASES = {
     "default": dj_database_url.parse(
-        "postgresql://postgres:szhgMuQeAFWCEwINwlIlfvVOrtmwdWUe@switchyard.proxy.rlwy.net:25669/railway", conn_max_age=600, ssl_require=True
+        "postgresql://postgres:dRdUaqbYsdokQKwieygnFELoEmCHgEVA@shortline.proxy.rlwy.net:43982/railway", conn_max_age=600, ssl_require=True
     )
 }
 
@@ -353,26 +353,68 @@ class EmailVerificationRateThrottle(AnonRateThrottle):
 CSRF_COOKIE_SECURE = True  # Use HTTPS for CSRF cookies
 SESSION_COOKIE_SECURE = True  # Use HTTPS for session cookies
 
+# Redis & Celery Configuration (Production)
+
+# Use Railway Redis connection details from environment
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = os.getenv("REDIS_PORT", "6379")
+REDIS_DB = os.getenv("REDIS_DB", "1")
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
+
+REDIS_URL = "redis://default:NRccqsfPXEVUxIyNAlWSWYzbYiPAYLiA@shuttle.proxy.rlwy.net:44451/1"
+
+
+# Construct Redis URL
+REDIS_URL = os.getenv(
+    "REDIS_URL",
+    f"redis://default:{REDIS_PASSWORD}@{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
+)
+
 # Celery Configuration
-CELERY_BROKER_URL = f"redis://{os.getenv('REDIS_HOST')}:{os.getenv('REDIS_PORT')}/1"
-CELERY_RESULT_BACKEND = f"redis://{os.getenv('REDIS_HOST')}:{os.getenv('REDIS_PORT')}/1"
+CELERY_BROKER_URL = REDIS_URL
+CELERY_RESULT_BACKEND = REDIS_URL
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
 CELERY_TASK_TRACK_STARTED = True
-CELERY_TASK_TIME_LIMIT = 30 * 60
+CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutes
 
-# Redis cache configuration
+# Django Caching with Redis
 CACHES = {
     'default': {
         'BACKEND': 'django_redis.cache.RedisCache',
-        'LOCATION': f"redis://{os.getenv('REDIS_HOST')}:{os.getenv('REDIS_PORT')}/{os.getenv('REDIS_DB')}",
+        'LOCATION': REDIS_URL,
         'OPTIONS': {
             'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            'PASSWORD': REDIS_PASSWORD,
         }
     }
 }
+
+# REDIS_URL = os.getenv('REDIS_URL')
+
+
+# # Celery Configuration
+# CELERY_BROKER_URL = f"redis://{os.getenv('REDIS_HOST')}:{os.getenv('REDIS_PORT')}/1"
+# CELERY_RESULT_BACKEND = f"redis://{os.getenv('REDIS_HOST')}:{os.getenv('REDIS_PORT')}/1"
+# CELERY_ACCEPT_CONTENT = ['json']
+# CELERY_TASK_SERIALIZER = 'json'
+# CELERY_RESULT_SERIALIZER = 'json'
+# CELERY_TIMEZONE = TIME_ZONE
+# CELERY_TASK_TRACK_STARTED = True
+# CELERY_TASK_TIME_LIMIT = 30 * 60
+
+# # Redis cache configuration
+# CACHES = {
+#     'default': {
+#         'BACKEND': 'django_redis.cache.RedisCache',
+#         'LOCATION': f"redis://{os.getenv('REDIS_HOST')}:{os.getenv('REDIS_PORT')}/{os.getenv('REDIS_DB')}",
+#         'OPTIONS': {
+#             'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+#         }
+#     }
+# }
 
 # Configure session to use the cache
 SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
