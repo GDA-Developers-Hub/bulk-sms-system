@@ -12,6 +12,7 @@ import secrets
 import string
 from django.core.mail import send_mail
 import logging
+from twilio.rest import Client
 
 load_dotenv()
 
@@ -161,68 +162,182 @@ class SMSGatewayInterface:
 class AfricasTalkingGateway(SMSGatewayInterface):
     """Integration with Africa's Talking SMS Gateway"""
     def __init__(self):
-        self.api_key = os.getenv('AT_API_KEY')
-        self.username = os.getenv('AT_USERNAME')
-        self.api_url = "https://api.africastalking.com/version1/messaging"
+        # Use settings rather than direct env vars for consistency
+        self.api_key = settings.AFRICASTALKING_API_KEY
+        self.username = settings.AFRICASTALKING_USERNAME
+        self.sender_id = settings.AFRICASTALKING_SENDER_ID
+        try:
+            # Initialize the Africa's Talking SDK
+            self.at_gateway = africastalking.initialize(self.username, self.api_key)
+            self.sms = self.at_gateway.SMS
+        except Exception as e:
+            logger.error(f"Error initializing Africa's Talking: {str(e)}")
+            self.sms = None
         
     def send_sms(self, to, message, sender=None):
         """Send an SMS message via Africa's Talking"""
-        headers = {
-            'Accept': 'application/json',
-            'Content-Type': 'application/x-www-form-urlencoded',
-            'ApiKey': self.api_key
-        }
-        
-        data = {
-            'username': self.username,
-            'message': message,
-            'to': to
-        }
-        
-        if sender:
-            data['from'] = sender
+        try:
+            # Use the SDK to send SMS
+            if not sender:
+                sender = self.sender_id
+                
+            # Ensure the number is properly formatted
+            if not to.startswith('+'):
+                to = '+' + to
+                
+            # Send the SMS
+            response = self.sms.send(
+                message=message,
+                recipients=[to],
+                sender_id=sender
+            )
             
-        response = requests.post(self.api_url, headers=headers, data=data)
-        
-        return response.json()
+            # Process the response
+            if response and 'SMSMessageData' in response and 'Recipients' in response['SMSMessageData']:
+                recipients = response['SMSMessageData']['Recipients']
+                if recipients and len(recipients) > 0:
+                    recipient = recipients[0]
+                    status_code = recipient.get('statusCode')
+                    
+                    if status_code == 101 or status_code == 100:
+                        # Success codes
+                        return {
+                            'status': 'success',
+                            'message_id': recipient.get('messageId'),
+                            'to': recipient.get('number'),
+                            'provider': 'africastalking',
+                            'status_code': status_code,
+                            'cost': recipient.get('cost')
+                        }
+                    else:
+                        # Error codes
+                        return {
+                            'status': 'error',
+                            'error': recipient.get('status'),
+                            'to': recipient.get('number'),
+                            'provider': 'africastalking',
+                            'status_code': status_code
+                        }
+            
+            # Handle unexpected response format
+            return {
+                'status': 'error',
+                'error': 'Invalid response from Africa\'s Talking',
+                'to': to,
+                'message': message,
+                'provider': 'africastalking',
+                'raw_response': response
+            }
+            
+        except Exception as e:
+            logger.error(f"Error sending SMS via Africa's Talking: {str(e)}")
+            return {
+                'status': 'error',
+                'error': str(e),
+                'to': to,
+                'message': message,
+                'provider': 'africastalking'
+            }
     
     def check_delivery_status(self, message_id):
         """Check the delivery status of a message via Africa's Talking"""
-        # Implementation varies based on Africa's Talking API for delivery reports
-        pass
-
-
-# class TwilioGateway(SMSGatewayInterface):
-#     """Integration with Twilio SMS Gateway"""
-#     def __init__(self):
-#         self.account_sid = os.getenv('TWILIO_ACCOUNT_SID')
-#         self.auth_token = os.getenv('TWILIO_AUTH_TOKEN')
-#         self.api_url = f"https://api.twilio.com/2010-04-01/Accounts/{self.account_sid}/Messages.json"
-        
-#     def send_sms(self, to, message, sender=None):
-#         """Send an SMS message via Twilio"""
-#         if not sender:
-#             sender = os.getenv('TWILIO_PHONE_NUMBER')
+        try:
+            # Africa's Talking provides delivery reports via callbacks
+            # For direct status checking, we need to simulate based on the last status
+            # We'll implement a basic mapping to our internal statuses
             
-#         auth = (self.account_sid, self.auth_token)
-#         data = {
-#             'To': to,
-#             'From': sender,
-#             'Body': message
-#         }
+            # In a real implementation, you might want to store message statuses in a database
+            # and update them when callbacks are received
+            
+            # For now, we'll just return 'sent' status as Africa's Talking doesn't have
+            # a direct API for checking message status by ID
+            return {
+                'status': 'success',
+                'message_id': message_id,
+                'delivery_status': 'sent',  # Default to 'sent' since we can't check directly
+                'provider': 'africastalking'
+            }
+            
+        except Exception as e:
+            logger.error(f"Error checking delivery status via Africa's Talking: {str(e)}")
+            return {
+                'status': 'error',
+                'error': str(e),
+                'message_id': message_id,
+                'provider': 'africastalking'
+            }
+
+
+class TwilioGateway(SMSGatewayInterface):
+    """Integration with Twilio SMS Gateway"""
+    def __init__(self):
+        self.account_sid = settings.TWILIO_ACCOUNT_SID
+        self.auth_token = settings.TWILIO_AUTH_TOKEN
+        self.phone_number = settings.TWILIO_PHONE_NUMBER
+        self.client = Client(self.account_sid, self.auth_token)
         
-#         response = requests.post(self.api_url, auth=auth, data=data)
-        
-#         return response.json()
+    def send_sms(self, to, message, sender=None):
+        """Send an SMS message via Twilio"""
+        try:
+            if not sender:
+                sender = self.phone_number
+                
+            # Format the phone number if needed
+            to = format_phone_number(to)
+            
+            # Send the message
+            twilio_message = self.client.messages.create(
+                body=message,
+                from_=sender,
+                to=to
+            )
+            
+            return {
+                'status': 'success',
+                'message_id': twilio_message.sid,
+                'to': to,
+                'message': message,
+                'provider': 'twilio'
+            }
+        except Exception as e:
+            logger.error(f"Error sending SMS via Twilio: {str(e)}")
+            return {
+                'status': 'error',
+                'error': str(e),
+                'to': to,
+                'message': message,
+                'provider': 'twilio'
+            }
     
-#     def check_delivery_status(self, message_id):
-#         """Check the delivery status of a message via Twilio"""
-#         url = f"{self.api_url.replace('.json', '')}/{message_id}.json"
-#         auth = (self.account_sid, self.auth_token)
-        
-#         response = requests.get(url, auth=auth)
-        
-#         return response.json()
+    def check_delivery_status(self, message_id):
+        """Check the delivery status of a message via Twilio"""
+        try:
+            message = self.client.messages(message_id).fetch()
+            
+            # Map Twilio status to our internal status
+            status_map = {
+                'queued': 'queued',
+                'sending': 'sending',
+                'sent': 'sent',
+                'delivered': 'delivered',
+                'undelivered': 'failed',
+                'failed': 'failed'
+            }
+            
+            return {
+                'status': 'success',
+                'message_id': message_id,
+                'delivery_status': status_map.get(message.status, 'unknown'),
+                'provider': 'twilio'
+            }
+        except Exception as e:
+            logger.error(f"Error checking delivery status via Twilio: {str(e)}")
+            return {
+                'status': 'error',
+                'error': str(e),
+                'message_id': message_id,
+                'provider': 'twilio'
+            }
 
 
 class SMSGatewayFactory:

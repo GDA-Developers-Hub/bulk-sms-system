@@ -10,13 +10,14 @@ from django.contrib.auth import authenticate
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 from .models import (
-    User, ContactGroup, Contact, SMSCampaign,
-    SMSMessage, Payment, SMSTemplate, WebhookEndpoint
+    User, ContactGroup, Contact, Campaign, SMSMessage,
+    Payment, SMSTemplate, WebhookEndpoint, MessageTemplate
 )
-
-User = get_user_model()
 from django.core.validators import RegexValidator
 from django.utils.translation import gettext_lazy as _
+import re
+
+User = get_user_model()
 
 # Create custom validator for African phone numbers
 class AfricanPhoneNumberValidator:
@@ -499,95 +500,38 @@ class ContactSerializer(serializers.ModelSerializer):
         return data
 
 
-class SMSCampaignSerializer(serializers.ModelSerializer):
-    groups = serializers.PrimaryKeyRelatedField(
-        queryset=ContactGroup.objects.all(),
-        many=True,
-        required=False
-    )
-    total_recipients = serializers.SerializerMethodField()
-    delivered_count = serializers.SerializerMethodField()
-    failed_count = serializers.SerializerMethodField()
-    estimated_cost = serializers.SerializerMethodField()
-    template_name = serializers.CharField(source='template.name', read_only=True)
-    
-    class Meta:
-        model = SMSCampaign
-        fields = ('id', 'name', 'message', 'sender_id', 'type', 'status', 
-                  'groups', 'scheduled_time', 'completed_time', 'recipient_count', 
-                  'delivery_rate', 'template', 'template_name', 'total_recipients',
-                  'delivered_count', 'failed_count', 'estimated_cost',
-                  'metadata', 'created_at', 'updated_at')
-        read_only_fields = ('id', 'completed_time', 'delivery_rate', 'recipient_count',
-                           'created_at', 'updated_at')
-    
-    def get_total_recipients(self, obj):
-        return obj.get_recipients_count()
-    
-    def get_delivered_count(self, obj):
-        return SMSMessage.objects.filter(campaign=obj, delivery_status='delivered').count()
-    
-    def get_failed_count(self, obj):
-        return SMSMessage.objects.filter(campaign=obj, delivery_status__in=['failed', 'rejected', 'expired']).count()
-    
-    def get_estimated_cost(self, obj):
-        return obj.calculate_estimated_cost()
-        
-    def validate_groups(self, groups):
-        user = self.context['request'].user
-        
-        # Validate that all groups belong to the current user
-        for group in groups:
-            if group.user != user:
-                raise serializers.ValidationError(f"You don't have permission to use the group: {group.name}")
-        
-        return groups
-    
-    def validate(self, data):
-        # Ensure scheduled campaigns have a scheduled_time
-        if data.get('status') == 'scheduled' and not data.get('scheduled_time'):
-            raise serializers.ValidationError({
-                "scheduled_time": "A scheduled time is required for scheduled campaigns."
-            })
-            
-        # Ensure scheduled_time is in the future
-        if data.get('scheduled_time') and data.get('scheduled_time') < timezone.now():
-            raise serializers.ValidationError({
-                "scheduled_time": "Scheduled time must be in the future."
-            })
-            
-        return data
+class CampaignSerializer(serializers.ModelSerializer):
+    statistics = serializers.SerializerMethodField()
 
-    def create(self, validated_data):
-        groups = validated_data.pop('groups', [])
-        validated_data['user'] = self.context['request'].user
-        
-        campaign = super().create(validated_data)
-        
-        # Add the groups
-        if groups:
-            campaign.groups.set(groups)
-            
-            # Update recipient count
-            campaign.recipient_count = campaign.get_recipients_count()
-            campaign.save(update_fields=['recipient_count'])
-            
-        return campaign
-    
-    def update(self, instance, validated_data):
-        groups = validated_data.pop('groups', None)
-        
-        campaign = super().update(instance, validated_data)
-        
-        # Update groups if provided
-        if groups is not None:
-            campaign.groups.set(groups)
-            
-            # Update recipient count
-            campaign.recipient_count = campaign.get_recipients_count()
-            campaign.save(update_fields=['recipient_count'])
-            
-        return campaign
+    class Meta:
+        model = Campaign
+        fields = ('id', 'name', 'description', 'type', 'status', 'message', 
+                 'template', 'groups', 'recipient_count', 'scheduled_time', 
+                 'started_at', 'completed_at', 'sender_id', 'created_at', 
+                 'updated_at', 'metadata', 'statistics')
+        read_only_fields = ('id', 'recipient_count', 'started_at', 'completed_at', 
+                          'created_at', 'updated_at', 'statistics')
+
+    def get_statistics(self, obj):
+        return obj.get_statistics()
+
+    def validate(self, attrs):
+        # Ensure at least one group is selected
+        if not attrs.get('groups'):
+            raise serializers.ValidationError({"groups": "At least one contact group is required."})
+
+        # Validate scheduled time is in the future
+        scheduled_time = attrs.get('scheduled_time')
+        if scheduled_time and scheduled_time < timezone.now():
+            raise serializers.ValidationError({"scheduled_time": "Scheduled time must be in the future."})
+
+        # Ensure either message or template is provided
+        if not attrs.get('message') and not attrs.get('template'):
+            raise serializers.ValidationError(
+                "Either a message or a template must be provided."
+            )
+
+        return attrs
 
 
 class SMSMessageSerializer(serializers.ModelSerializer):
@@ -650,17 +594,6 @@ class PaymentSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
-class SMSTemplateSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = SMSTemplate
-        fields = ('id', 'name', 'content', 'metadata', 'created_at', 'updated_at')
-        read_only_fields = ('id', 'created_at', 'updated_at')
-
-    def create(self, validated_data):
-        validated_data['user'] = self.context['request'].user
-        return super().create(validated_data)
-
-
 class WebhookEndpointSerializer(serializers.ModelSerializer):
     class Meta:
         model = WebhookEndpoint
@@ -670,3 +603,81 @@ class WebhookEndpointSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         validated_data['user'] = self.context['request'].user
         return super().create(validated_data)
+
+
+class MessageTemplateSerializer(serializers.ModelSerializer):
+    """Serializer for message templates"""
+    
+    verification_status_display = serializers.CharField(
+        source='get_verification_status_display',
+        read_only=True
+    )
+    category_display = serializers.CharField(
+        source='get_category_display',
+        read_only=True
+    )
+    
+    class Meta:
+        model = MessageTemplate
+        fields = [
+            'id', 'name', 'content', 'category', 'category_display',
+            'verification_status', 'verification_status_display',
+            'rejection_reason', 'variables', 'metadata', 'is_active',
+            'created_at', 'updated_at', 'last_used_at', 'usage_count'
+        ]
+        read_only_fields = [
+            'id', 'verification_status', 'verification_status_display',
+            'rejection_reason', 'metadata', 'created_at', 'updated_at',
+            'last_used_at', 'usage_count'
+        ]
+
+    def validate_content(self, value):
+        """Validate template content"""
+        # Check minimum length
+        if len(value) < 5:
+            raise serializers.ValidationError(
+                "Template content must be at least 5 characters long"
+            )
+        
+        # Check maximum length (considering SMS segments)
+        if len(value) > 918:  # Max 6 segments of 153 characters
+            raise serializers.ValidationError(
+                "Template content exceeds maximum length of 918 characters (6 SMS segments)"
+            )
+        
+        # Validate variable syntax
+        variables = re.findall(r'\{([^}]+)\}', value)
+        for var in variables:
+            if not re.match(r'^[a-zA-Z][a-zA-Z0-9_]*$', var):
+                raise serializers.ValidationError(
+                    f"Invalid variable name: {var}. Variables must start with a letter "
+                    "and contain only letters, numbers, and underscores"
+                )
+        
+        return value
+
+    def validate(self, data):
+        """Validate the entire template data"""
+        content = data.get('content', '')
+        
+        # Extract variables from content
+        variables = re.findall(r'\{([^}]+)\}', content)
+        
+        # Update variables field
+        data['variables'] = list(set(variables))  # Remove duplicates
+        
+        return data
+
+    def to_representation(self, instance):
+        """Customize the template representation"""
+        data = super().to_representation(instance)
+        
+        # Add segment count
+        content_length = len(instance.content)
+        data['segments'] = (content_length // 160) + (1 if content_length % 160 > 0 else 0)
+        
+        # Add verification details if available
+        if instance.metadata.get('verification_metadata'):
+            data['verification_details'] = instance.metadata['verification_metadata']
+        
+        return data

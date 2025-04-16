@@ -6,6 +6,8 @@ from django.utils import timezone
 from phonenumber_field.modelfields import PhoneNumberField
 from django.utils.translation import gettext_lazy as _
 import uuid
+from django.conf import settings
+from django.contrib.auth import get_user_model
 
 class User(AbstractUser):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -128,67 +130,117 @@ class Contact(models.Model):
         super().save(*args, **kwargs)
 
 
-class SMSCampaign(models.Model):
-    """SMS campaigns for sending messages"""
-    STATUS_CHOICES = [
-        ('draft', 'Draft'),
-        ('scheduled', 'Scheduled'),
-        ('sending', 'Sending'),
-        ('processing', 'Processing'),
-        ('completed', 'Completed'),
-        ('failed', 'Failed'),
-        ('cancelled', 'Cancelled'),
-    ]
+class Campaign(models.Model):
+    """Model for SMS campaigns"""
     
-    TYPE_CHOICES = [
-        ('single', 'Single Message'),
-        ('bulk', 'Bulk Message'),
-        ('periodic', 'Periodic Message'),
-    ]
-    
+    class Status(models.TextChoices):
+        DRAFT = 'draft', 'Draft'
+        SCHEDULED = 'scheduled', 'Scheduled'
+        PROCESSING = 'processing', 'Processing'
+        PAUSED = 'paused', 'Paused'
+        COMPLETED = 'completed', 'Completed'
+        CANCELLED = 'cancelled', 'Cancelled'
+        FAILED = 'failed', 'Failed'
+
+    class Type(models.TextChoices):
+        BULK = 'bulk', 'Bulk SMS'
+        PERSONALIZED = 'personalized', 'Personalized SMS'
+        TEMPLATE = 'template', 'Template-based'
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='campaigns')
-    name = models.CharField(max_length=100)
+    user = models.ForeignKey(get_user_model(), on_delete=models.CASCADE, related_name='campaigns')
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True, null=True)
+    type = models.CharField(max_length=20, choices=Type.choices, default=Type.BULK)
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
+    
+    # Content and Recipients
     message = models.TextField()
-    sender_id = models.CharField(max_length=20)
-    type = models.CharField(max_length=20, choices=TYPE_CHOICES, default='single')
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
-    groups = models.ManyToManyField(ContactGroup, related_name='campaigns', blank=True)
-    scheduled_time = models.DateTimeField(null=True, blank=True)
-    completed_time = models.DateTimeField(null=True, blank=True)
+    template = models.ForeignKey('MessageTemplate', on_delete=models.SET_NULL, null=True, blank=True)
+    groups = models.ManyToManyField('ContactGroup', related_name='campaigns')
     recipient_count = models.IntegerField(default=0)
-    delivery_rate = models.FloatField(default=0.0)
-    template = models.ForeignKey(SMSTemplate, on_delete=models.SET_NULL, 
-                                 related_name='campaigns', null=True, blank=True)
-    metadata = models.JSONField(default=dict, blank=True)
+    
+    # Scheduling
+    scheduled_time = models.DateTimeField(null=True, blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    
+    # Sender Configuration
+    sender_id = models.CharField(max_length=11, blank=True)  # Africa's Talking sender ID limit
+    
+    # Tracking
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['user', 'status']),
+            models.Index(fields=['scheduled_time']),
+        ]
+
     def __str__(self):
-        return self.name
-    
+        return f"{self.name} ({self.status})"
+
     def get_recipients_count(self):
-        """Get total number of recipients for this campaign"""
-        if self.groups.exists():
-            # Count unique contacts in all selected groups
-            contact_ids = Contact.objects.filter(group__in=self.groups.all()).values_list('id', flat=True).distinct()
-            return len(contact_ids)
-        else:
-            # If no groups selected, use the count stored in the model
-            return self.recipient_count
-    
-    def calculate_estimated_cost(self):
-        """Calculate the estimated cost of this campaign based on recipient count"""
-        # Simple estimation: 1 token per recipient
-        # This can be enhanced with more complex logic
-        return self.get_recipients_count()
-    
-    def save(self, *args, **kwargs):
-        # If campaign is being marked as completed, set completed_time
-        if self.status == 'completed' and not self.completed_time:
-            self.completed_time = timezone.now()
-        
-        super().save(*args, **kwargs)
+        """Calculate total number of recipients across all groups"""
+        return Contact.objects.filter(group__in=self.groups.all()).distinct().count()
+
+    def update_recipient_count(self):
+        """Update the recipient count"""
+        self.recipient_count = self.get_recipients_count()
+        self.save(update_fields=['recipient_count'])
+
+    def start_campaign(self):
+        """Start the campaign"""
+        if self.status != self.Status.DRAFT:
+            raise ValueError("Campaign can only be started from draft status")
+
+        self.status = self.Status.PROCESSING
+        self.started_at = timezone.now()
+        self.save(update_fields=['status', 'started_at', 'updated_at'])
+
+    def pause_campaign(self):
+        """Pause the campaign"""
+        if self.status not in [self.Status.PROCESSING, self.Status.SCHEDULED]:
+            raise ValueError("Only processing or scheduled campaigns can be paused")
+
+        self.status = self.Status.PAUSED
+        self.save(update_fields=['status', 'updated_at'])
+
+    def resume_campaign(self):
+        """Resume the campaign"""
+        if self.status != self.Status.PAUSED:
+            raise ValueError("Only paused campaigns can be resumed")
+
+        self.status = self.Status.PROCESSING
+        self.save(update_fields=['status', 'updated_at'])
+
+    def cancel_campaign(self):
+        """Cancel the campaign"""
+        if self.status in [self.Status.COMPLETED, self.Status.CANCELLED]:
+            raise ValueError("Cannot cancel completed or already cancelled campaigns")
+
+        self.status = self.Status.CANCELLED
+        self.save(update_fields=['status', 'updated_at'])
+
+    def complete_campaign(self):
+        """Mark campaign as completed"""
+        self.status = self.Status.COMPLETED
+        self.completed_at = timezone.now()
+        self.save(update_fields=['status', 'completed_at', 'updated_at'])
+
+    def get_statistics(self):
+        """Get campaign statistics"""
+        messages = self.messages.all()
+        return {
+            'total_messages': messages.count(),
+            'delivered': messages.filter(status=SMSMessage.Status.DELIVERED).count(),
+            'failed': messages.filter(status=SMSMessage.Status.FAILED).count(),
+            'pending': messages.filter(status=SMSMessage.Status.PENDING).count(),
+            'sent': messages.filter(status=SMSMessage.Status.SENT).count(),
+        }
 
 
 class SMSMessage(models.Model):
@@ -212,7 +264,7 @@ class SMSMessage(models.Model):
     ]
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    campaign = models.ForeignKey(SMSCampaign, on_delete=models.CASCADE, related_name='messages', null=True, blank=True)
+    campaign = models.ForeignKey(Campaign, on_delete=models.CASCADE, related_name='messages', null=True, blank=True)
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='messages')
     contact = models.ForeignKey(Contact, on_delete=models.SET_NULL, related_name='messages', null=True, blank=True)
     recipient = models.CharField(max_length=20)
@@ -250,7 +302,7 @@ class SMSMessage(models.Model):
             
             if remaining == 0:
                 self.campaign.status = 'completed'
-                self.campaign.completed_time = timezone.now()
+                self.campaign.completed_at = timezone.now()
                 self.campaign.save()
             
         self.save(update_fields=['delivery_status', 'delivery_time', 'updated_at'])
@@ -284,3 +336,54 @@ class WebhookEndpoint(models.Model):
     metadata = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+
+class MessageTemplate(models.Model):
+    """Model for managing message templates with content verification"""
+    
+    class VerificationStatus(models.TextChoices):
+        PENDING = 'pending', 'Pending Review'
+        APPROVED = 'approved', 'Approved'
+        REJECTED = 'rejected', 'Rejected'
+        FLAGGED = 'flagged', 'Flagged for Review'
+
+    class TemplateCategory(models.TextChoices):
+        MARKETING = 'marketing', 'Marketing'
+        TRANSACTIONAL = 'transactional', 'Transactional'
+        NOTIFICATION = 'notification', 'Notification'
+        OTP = 'otp', 'One-Time Password'
+        REMINDER = 'reminder', 'Reminder'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    name = models.CharField(max_length=100)
+    content = models.TextField()
+    category = models.CharField(
+        max_length=20,
+        choices=TemplateCategory.choices,
+        default=TemplateCategory.MARKETING
+    )
+    verification_status = models.CharField(
+        max_length=20,
+        choices=VerificationStatus.choices,
+        default=VerificationStatus.PENDING
+    )
+    rejection_reason = models.TextField(null=True, blank=True)
+    variables = models.JSONField(default=list)  # List of variables in the template
+    metadata = models.JSONField(default=dict)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    last_used_at = models.DateTimeField(null=True, blank=True)
+    usage_count = models.IntegerField(default=0)
+
+    def __str__(self):
+        return f"{self.name} - {self.category} ({self.verification_status})"
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['verification_status']),
+            models.Index(fields=['category']),
+            models.Index(fields=['user', 'is_active'])
+        ]

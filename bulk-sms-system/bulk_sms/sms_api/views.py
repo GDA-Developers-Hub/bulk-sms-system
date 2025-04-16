@@ -19,7 +19,7 @@ from rest_framework_simplejwt.tokens import AccessToken
 from datetime import timedelta
 from django.utils import timezone
 import logging
-from .models import SMSTemplate, ContactGroup, Contact
+from .models import SMSTemplate, ContactGroup, Contact, WebhookEndpoint, MessageTemplate, Campaign, SMSMessage, Payment
 from utils.sms_gateways import (
     validate_african_phone, generate_verification_token, 
     is_token_valid, send_verification_email, format_phone_number, 
@@ -30,11 +30,15 @@ from .serializers import (
     EmailVerificationConfirmSerializer, UserSerializer, TokenRefreshSerializer,
     ChangePasswordSerializer, ResetPasswordRequestSerializer, ResetPasswordConfirmSerializer,
     UserProfileUpdateSerializer, ContactGroupSerializer, ContactSerializer, 
-    SMSCampaignSerializer, PaymentSerializer, SMSTemplateSerializer,
-    WebhookEndpointSerializer, SMSMessageSerializer, LoginSerializer
+    PaymentSerializer, SMSTemplateSerializer, WebhookEndpointSerializer, 
+    SMSMessageSerializer, LoginSerializer, MessageTemplateSerializer, CampaignSerializer
 )
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
+import requests
+import uuid
+from .services import TemplateVerificationService, SMSService
+from .tasks import send_campaign_messages
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
@@ -412,140 +416,212 @@ class LoginView(APIView):
 
 class SMSTemplateViewSet(viewsets.ModelViewSet):
     """
-    API endpoint for managing SMS templates
-    
-    Provides CRUD operations:
-    - list: GET /smstemplates/
-    - retrieve: GET /smstemplates/{id}/
-    - create: POST /smstemplates/
-    - update: PUT /smstemplates/{id}/
-    - partial_update: PATCH /smstemplates/{id}/
-    - destroy: DELETE /smstemplates/{id}/
-    
-    Additional actions:
-    - mark_used: POST /smstemplates/{id}/mark_used/
-    - categories: GET /smstemplates/categories/
+    API endpoint that allows SMS templates to be viewed or edited.
     """
+    queryset = SMSTemplate.objects.all()
     serializer_class = SMSTemplateSerializer
     permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ['name', 'content', 'category']
-    ordering_fields = ['name', 'category', 'created_at', 'updated_at', 'last_used']
-    ordering = ['-created_at']
-    
+
     def get_queryset(self):
-        """Return templates owned by the current user"""
+        """
+        This view returns templates for the currently authenticated user.
+        """
         return SMSTemplate.objects.filter(user=self.request.user)
-    
+
+    @swagger_auto_schema(
+        operation_description="List all SMS templates belonging to the authenticated user"
+    )
     def list(self, request, *args, **kwargs):
-        """
-        List all SMS templates for the current user
-        GET /smstemplates/
-        """
-        queryset = self.filter_queryset(self.get_queryset())
-        page = self.paginate_queryset(queryset)
-        
-        if page is not None:
-            serializer = self.get_serializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
-            
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
-    
-    def retrieve(self, request, *args, **kwargs):
-        """
-        Retrieve a specific SMS template by ID
-        GET /smstemplates/{id}/
-        """
-        instance = self.get_object()
-        serializer = self.get_serializer(instance)
-        return Response(serializer.data)
-    
+        return super().list(request, *args, **kwargs)
+
+    @swagger_auto_schema(
+        operation_description="Create a new SMS template"
+    )
     def create(self, request, *args, **kwargs):
+        return super().create(request, *args, **kwargs)
+
+
+class WebhookEndpointViewSet(viewsets.ModelViewSet):
+    """
+    API endpoint that allows webhook endpoints to be viewed or edited.
+    """
+    queryset = WebhookEndpoint.objects.all()
+    serializer_class = WebhookEndpointSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
         """
-        Create a new SMS template
-        POST /smstemplates/
+        This view returns webhook endpoints for the currently authenticated user.
         """
-        # Add current user to the data
+        return WebhookEndpoint.objects.filter(user=self.request.user)
+    
+    @swagger_auto_schema(
+        operation_description="List all webhook endpoints configured by the authenticated user"
+    )
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @swagger_auto_schema(
+        operation_description="Create a new webhook endpoint",
+        request_body=WebhookEndpointSerializer
+    )
+    def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        
+        # Add the current user
         serializer.save(user=request.user)
         
-        headers = self.get_success_headers(serializer.data)
-        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
     
-    def update(self, request, *args, **kwargs):
-        """
-        Update an existing SMS template (full update)
-        PUT /smstemplates/{id}/
-        """
-        partial = kwargs.pop('partial', False)
-        instance = self.get_object()
-        serializer = self.get_serializer(instance, data=request.data, partial=partial)
-        serializer.is_valid(raise_exception=True)
-        self.perform_update(serializer)
-        
-        if getattr(instance, '_prefetched_objects_cache', None):
-            instance._prefetched_objects_cache = {}
-            
-        return Response(serializer.data)
-    
-    def partial_update(self, request, *args, **kwargs):
-        """
-        Partially update an SMS template
-        PATCH /smstemplates/{id}/
-        """
-        kwargs['partial'] = True
-        return self.update(request, *args, **kwargs)
-    
-    def destroy(self, request, *args, **kwargs):
-        """
-        Delete an SMS template
-        DELETE /smstemplates/{id}/
-        """
-        instance = self.get_object()
-        self.perform_destroy(instance)
-        return Response(status=status.HTTP_204_NO_CONTENT)
-    
+    @swagger_auto_schema(
+        operation_description="Test a webhook endpoint by sending a test event",
+        request_body=openapi.Schema(
+            type=openapi.TYPE_OBJECT,
+            properties={
+                'event_type': openapi.Schema(type=openapi.TYPE_STRING, description='Type of event to simulate (message.sent, message.delivered, etc.)'),
+            },
+            required=['event_type']
+        ),
+        responses={
+            200: openapi.Response(
+                description="Test webhook sent",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'status': openapi.Schema(type=openapi.TYPE_STRING),
+                        'message': openapi.Schema(type=openapi.TYPE_STRING),
+                    }
+                )
+            ),
+            400: "Bad request"
+        }
+    )
     @action(detail=True, methods=['post'])
-    def mark_used(self, request, pk=None):
-        """
-        Mark a template as used by updating last_used timestamp
-        POST /smstemplates/{id}/mark_used/
-        """
-        template = self.get_object()
-        template.last_used = timezone.now()
-        template.save(update_fields=['last_used'])
-        return Response({'status': 'template marked as used'})
-    
-    @action(detail=False, methods=['get'])
-    def categories(self, request):
-        """
-        Return available template categories
-        GET /smstemplates/categories/
-        """
-        categories = [{"value": key, "label": value} for key, value in SMSTemplate.CATEGORY_CHOICES]
-        return Response(categories)
-
-    @action(detail=False, methods=['get'])
-    def stats(self, request):
-        """
-        Get statistics about templates
-        GET /smstemplates/stats/
-        """
-        user_templates = self.get_queryset()
-        stats = {
-            'total_count': user_templates.count(),
-            'by_category': {},
-            'recently_used': user_templates.exclude(last_used=None).order_by('-last_used')[:5].values('id', 'name', 'last_used'),
-            'recently_created': user_templates.order_by('-created_at')[:5].values('id', 'name', 'created_at')
+    def test(self, request, pk=None):
+        """Send a test webhook event to the endpoint"""
+        webhook = self.get_object()
+        
+        if not webhook.is_active:
+            return Response(
+                {"detail": "Cannot test inactive webhook."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        event_type = request.data.get('event_type', 'test.event')
+        
+        # Create a test event payload
+        payload = {
+            'id': str(uuid.uuid4()),
+            'event': event_type,
+            'created': timezone.now().isoformat(),
+            'data': {
+                'test': True,
+                'message': 'This is a test webhook event'
+            }
         }
         
-        # Count by category
-        for key, label in SMSTemplate.CATEGORY_CHOICES:
-            stats['by_category'][key] = user_templates.filter(category=key).count()
+        # Send the webhook
+        try:
+            response = requests.post(
+                webhook.url,
+                json=payload,
+                headers={'Content-Type': 'application/json'},
+                timeout=5
+            )
             
-        return Response(stats)
+            webhook.metadata.update({
+                'last_test': {
+                    'timestamp': timezone.now().isoformat(),
+                    'event_type': event_type,
+                    'status_code': response.status_code,
+                    'response': response.text[:500]  # Limit response size
+                }
+            })
+            webhook.save(update_fields=['metadata', 'updated_at'])
+            
+            if response.status_code >= 200 and response.status_code < 300:
+                return Response({
+                    'status': 'success',
+                    'message': f'Test webhook sent successfully. Response: {response.status_code}'
+                })
+            else:
+                return Response({
+                    'status': 'warning',
+                    'message': f'Webhook sent but received non-success response: {response.status_code}'
+                })
+        
+        except Exception as e:
+            webhook.metadata.update({
+                'last_test': {
+                    'timestamp': timezone.now().isoformat(),
+                    'event_type': event_type,
+                    'error': str(e)
+                }
+            })
+            webhook.save(update_fields=['metadata', 'updated_at'])
+            
+            return Response({
+                'status': 'error',
+                'message': f'Error sending webhook: {str(e)}'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @swagger_auto_schema(
+        operation_description="Get event types supported by webhooks",
+        responses={
+            200: openapi.Response(
+                description="Event types",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_ARRAY,
+                    items=openapi.Schema(
+                        type=openapi.TYPE_OBJECT,
+                        properties={
+                            'value': openapi.Schema(type=openapi.TYPE_STRING),
+                            'label': openapi.Schema(type=openapi.TYPE_STRING),
+                            'description': openapi.Schema(type=openapi.TYPE_STRING),
+                        }
+                    )
+                )
+            )
+        }
+    )
+    @action(detail=False, methods=['get'])
+    def event_types(self, request):
+        """Get the list of event types supported by webhooks"""
+        events = [
+            {
+                'value': 'message.sent',
+                'label': 'Message Sent',
+                'description': 'Triggered when a message is sent to the SMS gateway'
+            },
+            {
+                'value': 'message.delivered',
+                'label': 'Message Delivered',
+                'description': 'Triggered when a message is delivered to the recipient'
+            },
+            {
+                'value': 'message.failed',
+                'label': 'Message Failed',
+                'description': 'Triggered when a message fails to send or deliver'
+            },
+            {
+                'value': 'campaign.started',
+                'label': 'Campaign Started',
+                'description': 'Triggered when a campaign starts sending messages'
+            },
+            {
+                'value': 'campaign.completed',
+                'label': 'Campaign Completed',
+                'description': 'Triggered when a campaign completes sending all messages'
+            },
+            {
+                'value': 'payment.successful',
+                'label': 'Payment Successful',
+                'description': 'Triggered when a payment is completed successfully'
+            }
+        ]
+        
+        return Response(events)
 
 
 class LogoutView(APIView):
@@ -869,6 +945,7 @@ class ContactGroupViewSet(viewsets.ModelViewSet):
     """
     API endpoint that allows contact groups to be viewed or edited.
     """
+    queryset = ContactGroup.objects.all()
     serializer_class = ContactGroupSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
@@ -941,6 +1018,7 @@ class ContactViewSet(viewsets.ModelViewSet):
     """
     API endpoint that allows contacts to be viewed or edited.
     """
+    queryset = Contact.objects.all()
     serializer_class = ContactSerializer
     permission_classes = [permissions.IsAuthenticated]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
@@ -1080,351 +1158,140 @@ class ContactViewSet(viewsets.ModelViewSet):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
-class SMSCampaignViewSet(viewsets.ModelViewSet):
+class CampaignViewSet(viewsets.ModelViewSet):
     """
-    API endpoint that allows SMS campaigns to be created, viewed, edited, and sent.
+    ViewSet for managing SMS campaigns.
     """
-    serializer_class = SMSCampaignSerializer
+    queryset = Campaign.objects.all()
+    serializer_class = CampaignSerializer
     permission_classes = [permissions.IsAuthenticated]
-    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ['name', 'message', 'sender_id', 'status']
-    ordering_fields = ['name', 'created_at', 'updated_at', 'scheduled_time', 'status']
-    ordering = ['-created_at']
 
     def get_queryset(self):
-        """
-        This view returns campaigns for the currently authenticated user.
-        Filter by status if provided in query params.
-        """
-        queryset = SMSCampaign.objects.filter(user=self.request.user)
-        
-        # Filter by status if provided
-        status = self.request.query_params.get('status')
-        if status:
-            queryset = queryset.filter(status=status)
-            
-        # Filter by type if provided
-        campaign_type = self.request.query_params.get('type')
-        if campaign_type:
-            queryset = queryset.filter(type=campaign_type)
-            
-        return queryset
+        """Filter campaigns to show only those belonging to the current user"""
+        return self.queryset.filter(user=self.request.user)
 
-    @swagger_auto_schema(
-        operation_description="List all SMS campaigns belonging to the authenticated user"
-    )
-    def list(self, request, *args, **kwargs):
-        return super().list(request, *args, **kwargs)
-
-    @swagger_auto_schema(
-        operation_description="Create a new SMS campaign"
-    )
-    def create(self, request, *args, **kwargs):
-        return super().create(request, *args, **kwargs)
-    
-    @swagger_auto_schema(
-        operation_description="Retrieve a specific SMS campaign by ID"
-    )
-    def retrieve(self, request, *args, **kwargs):
-        return super().retrieve(request, *args, **kwargs)
-    
-    @swagger_auto_schema(
-        operation_description="Update a specific SMS campaign"
-    )
-    def update(self, request, *args, **kwargs):
-        campaign = self.get_object()
-        
-        # Don't allow updates if campaign is not in draft status
-        if campaign.status not in ['draft', 'scheduled']:
-            return Response(
-                {"error": f"Cannot update campaign in '{campaign.status}' status. Only draft or scheduled campaigns can be updated."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-            
-        return super().update(request, *args, **kwargs)
-    
-    @swagger_auto_schema(
-        operation_description="Delete a specific SMS campaign"
-    )
-    def destroy(self, request, *args, **kwargs):
-        campaign = self.get_object()
-        
-        # Don't allow deletion if campaign is sending or processing
-        if campaign.status in ['sending', 'processing']:
-            return Response(
-                {"error": f"Cannot delete campaign in '{campaign.status}' status."},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-            
-        return super().destroy(request, *args, **kwargs)
+    def perform_create(self, serializer):
+        """Set the user when creating a new campaign"""
+        serializer.save(user=self.request.user)
 
     @action(detail=True, methods=['post'])
-    def send(self, request, pk=None):
-        """
-        Initiate sending of a draft campaign
-        """
+    def start(self, request, pk=None):
+        """Start a campaign"""
         campaign = self.get_object()
-        if campaign.status != 'draft':
+        
+        # Check if campaign can be started
+        if campaign.status != Campaign.Status.DRAFT:
             return Response(
-                {"error": "Only draft campaigns can be sent"},
+                {"error": "Campaign can only be started from draft status"},
                 status=status.HTTP_400_BAD_REQUEST
             )
+
+        if campaign.scheduled_time and campaign.scheduled_time > timezone.now():
+            # Schedule the campaign for later
+            campaign.status = Campaign.Status.SCHEDULED
+            campaign.save()
+            send_campaign_messages.apply_async(
+                args=[campaign.id],
+                eta=campaign.scheduled_time
+            )
+            return Response({"message": "Campaign scheduled successfully"})
+        else:
+            # Start the campaign immediately
+            campaign.status = Campaign.Status.PROCESSING
+            campaign.save()
+            send_campaign_messages.delay(campaign.id)
+            return Response({"message": "Campaign started successfully"})
+
+    @action(detail=True, methods=['post'])
+    def pause(self, request, pk=None):
+        """Pause a running campaign"""
+        campaign = self.get_object()
         
-        # Here you would implement the logic to send the campaign
-        # This is a placeholder for now
-        campaign.status = 'sending'
+        if campaign.status not in [Campaign.Status.PROCESSING, Campaign.Status.SCHEDULED]:
+            return Response(
+                {"error": "Only processing or scheduled campaigns can be paused"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        campaign.status = Campaign.Status.PAUSED
         campaign.save()
+        return Response({"message": "Campaign paused successfully"})
+
+    @action(detail=True, methods=['post'])
+    def resume(self, request, pk=None):
+        """Resume a paused campaign"""
+        campaign = self.get_object()
         
-        return Response({"status": "Campaign sending initiated"})
-        
-    @swagger_auto_schema(
-        operation_description="Cancel a scheduled SMS campaign",
-        responses={
-            200: openapi.Response(
-                description="Campaign cancelled successfully",
-                schema=openapi.Schema(
-                    type=openapi.TYPE_OBJECT,
-                    properties={
-                        'status': openapi.Schema(type=openapi.TYPE_STRING),
-                        'message': openapi.Schema(type=openapi.TYPE_STRING),
-                    }
-                )
-            ),
-            400: "Campaign not in scheduled status"
-        }
-    )
+        if campaign.status != Campaign.Status.PAUSED:
+            return Response(
+                {"error": "Only paused campaigns can be resumed"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        campaign.status = Campaign.Status.PROCESSING
+        campaign.save()
+        send_campaign_messages.delay(campaign.id)
+        return Response({"message": "Campaign resumed successfully"})
+
     @action(detail=True, methods=['post'])
     def cancel(self, request, pk=None):
-        """
-        Cancel a scheduled campaign
-        """
+        """Cancel a campaign"""
         campaign = self.get_object()
         
-        if campaign.status != 'scheduled':
+        if campaign.status in [Campaign.Status.COMPLETED, Campaign.Status.CANCELLED]:
             return Response(
-                {"error": "Only scheduled campaigns can be cancelled"},
+                {"error": "Cannot cancel completed or already cancelled campaigns"},
                 status=status.HTTP_400_BAD_REQUEST
             )
-            
-        campaign.status = 'cancelled'
+
+        campaign.status = Campaign.Status.CANCELLED
         campaign.save()
-        
-        return Response({
-            "status": "success",
-            "message": "Campaign cancelled successfully"
-        })
-    
-    @swagger_auto_schema(
-        operation_description="Get statistics for a specific campaign",
-        responses={
-            200: openapi.Response(
-                description="Campaign statistics",
-                schema=openapi.Schema(
-                    type=openapi.TYPE_OBJECT,
-                    properties={
-                        'campaign_id': openapi.Schema(type=openapi.TYPE_STRING),
-                        'campaign_name': openapi.Schema(type=openapi.TYPE_STRING),
-                        'status': openapi.Schema(type=openapi.TYPE_STRING),
-                        'total_recipients': openapi.Schema(type=openapi.TYPE_INTEGER),
-                        'messages': openapi.Schema(
-                            type=openapi.TYPE_OBJECT,
-                            properties={
-                                'total': openapi.Schema(type=openapi.TYPE_INTEGER),
-                                'queued': openapi.Schema(type=openapi.TYPE_INTEGER),
-                                'sent': openapi.Schema(type=openapi.TYPE_INTEGER),
-                                'delivered': openapi.Schema(type=openapi.TYPE_INTEGER),
-                                'failed': openapi.Schema(type=openapi.TYPE_INTEGER),
-                            }
-                        ),
-                        'delivery_rate': openapi.Schema(type=openapi.TYPE_NUMBER),
-                    }
-                )
-            )
-        }
-    )
+        return Response({"message": "Campaign cancelled successfully"})
+
     @action(detail=True, methods=['get'])
-    def stats(self, request, pk=None):
-        """
-        Get statistics for a campaign
-        """
+    def statistics(self, request, pk=None):
+        """Get campaign statistics"""
         campaign = self.get_object()
-        
-        # Get message statistics
         messages = SMSMessage.objects.filter(campaign=campaign)
-        total_messages = messages.count()
         
-        delivered = messages.filter(delivery_status='delivered').count()
-        failed = messages.filter(delivery_status__in=['failed', 'rejected', 'expired']).count()
-        queued = messages.filter(status='queued').count()
-        sent = messages.filter(status='sent').count()
-        
-        # Calculate delivery rate
-        delivery_rate = (delivered / total_messages * 100) if total_messages > 0 else 0
-        
-        return Response({
-            'campaign_id': str(campaign.id),
-            'campaign_name': campaign.name,
-            'status': campaign.status,
-            'total_recipients': campaign.recipient_count,
-            'messages': {
-                'total': total_messages,
-                'queued': queued,
-                'sent': sent,
-                'delivered': delivered,
-                'failed': failed,
-            },
-            'delivery_rate': round(delivery_rate, 2),
-            'created_at': campaign.created_at,
-            'updated_at': campaign.updated_at,
-            'completed_at': campaign.completed_time,
-        })
-    
-    @swagger_auto_schema(
-        operation_description="Get message details for a specific campaign",
-        responses={
-            200: openapi.Response(
-                description="Campaign message details",
-                schema=openapi.Schema(
-                    type=openapi.TYPE_OBJECT,
-                    properties={
-                        'campaign_id': openapi.Schema(type=openapi.TYPE_STRING),
-                        'campaign_name': openapi.Schema(type=openapi.TYPE_STRING),
-                        'messages': openapi.Schema(
-                            type=openapi.TYPE_ARRAY,
-                            items=openapi.Schema(
-                                type=openapi.TYPE_OBJECT,
-                                properties={
-                                    'id': openapi.Schema(type=openapi.TYPE_STRING),
-                                    'recipient': openapi.Schema(type=openapi.TYPE_STRING),
-                                    'status': openapi.Schema(type=openapi.TYPE_STRING),
-                                    'delivery_status': openapi.Schema(type=openapi.TYPE_STRING),
-                                }
-                            )
-                        ),
-                        'count': openapi.Schema(type=openapi.TYPE_INTEGER),
-                    }
-                )
-            )
+        stats = {
+            'total_messages': messages.count(),
+            'delivered': messages.filter(status=SMSMessage.Status.DELIVERED).count(),
+            'failed': messages.filter(status=SMSMessage.Status.FAILED).count(),
+            'pending': messages.filter(status=SMSMessage.Status.PENDING).count(),
+            'sent': messages.filter(status=SMSMessage.Status.SENT).count(),
         }
-    )
+        
+        return Response(stats)
+
     @action(detail=True, methods=['get'])
     def messages(self, request, pk=None):
-        """
-        Get messages for a campaign
-        """
+        """Get all messages in a campaign"""
         campaign = self.get_object()
-        
-        # Get all messages for this campaign
         messages = SMSMessage.objects.filter(campaign=campaign)
         
-        # Paginate if needed
-        page = self.paginate_queryset(messages)
-        if page is not None:
-            serializer = SMSMessageSerializer(page, many=True)
-            return self.get_paginated_response(serializer.data)
-            
+        # Add filtering
+        status = request.query_params.get('status')
+        if status:
+            messages = messages.filter(status=status)
+
+        # Add search
+        search = request.query_params.get('search')
+        if search:
+            messages = messages.filter(
+                Q(recipient__icontains=search) |
+                Q(message_id__icontains=search)
+            )
+
         serializer = SMSMessageSerializer(messages, many=True)
-        
-        return Response({
-            'campaign_id': str(campaign.id),
-            'campaign_name': campaign.name,
-            'messages': serializer.data,
-            'count': messages.count(),
-        })
-    
-    @swagger_auto_schema(
-        operation_description="Clone an existing campaign to create a new draft",
-        responses={
-            201: SMSCampaignSerializer,
-            400: "Bad request"
-        }
-    )
-    @action(detail=True, methods=['post'])
-    def clone(self, request, pk=None):
-        """
-        Clone a campaign to create a new draft
-        """
-        original = self.get_object()
-        
-        # Create a new campaign with the same data
-        new_campaign = SMSCampaign.objects.create(
-            user=request.user,
-            name=f"Copy of {original.name}",
-            message=original.message,
-            sender_id=original.sender_id,
-            type=original.type,
-            status='draft',  # Always create as draft
-            template=original.template,
-        )
-        
-        # Clone the groups
-        for group in original.groups.all():
-            new_campaign.groups.add(group)
-            
-        # Update recipient count
-        new_campaign.recipient_count = new_campaign.get_recipients_count()
-        new_campaign.save()
-        
-        serializer = self.get_serializer(new_campaign)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
-    
-    @swagger_auto_schema(
-        operation_description="Get campaign types",
-        responses={
-            200: openapi.Response(
-                description="Campaign types",
-                schema=openapi.Schema(
-                    type=openapi.TYPE_ARRAY,
-                    items=openapi.Schema(
-                        type=openapi.TYPE_OBJECT,
-                        properties={
-                            'value': openapi.Schema(type=openapi.TYPE_STRING),
-                            'label': openapi.Schema(type=openapi.TYPE_STRING),
-                        }
-                    )
-                )
-            )
-        }
-    )
-    @action(detail=False, methods=['get'])
-    def types(self, request):
-        """
-        Get campaign types
-        """
-        types = [{"value": key, "label": value} for key, value in SMSCampaign.TYPE_CHOICES]
-        return Response(types)
-    
-    @swagger_auto_schema(
-        operation_description="Get campaign statuses",
-        responses={
-            200: openapi.Response(
-                description="Campaign statuses",
-                schema=openapi.Schema(
-                    type=openapi.TYPE_ARRAY,
-                    items=openapi.Schema(
-                        type=openapi.TYPE_OBJECT,
-                        properties={
-                            'value': openapi.Schema(type=openapi.TYPE_STRING),
-                            'label': openapi.Schema(type=openapi.TYPE_STRING),
-                        }
-                    )
-                )
-            )
-        }
-    )
-    @action(detail=False, methods=['get'])
-    def statuses(self, request):
-        """
-        Get campaign statuses
-        """
-        statuses = [{"value": key, "label": value} for key, value in SMSCampaign.STATUS_CHOICES]
-        return Response(statuses)
+        return Response(serializer.data)
 
 
 class SMSMessageViewSet(viewsets.ModelViewSet):
     """
     API endpoint that allows SMS messages to be viewed or edited.
     """
+    queryset = SMSMessage.objects.all()  # Add default queryset
     serializer_class = SMSMessageSerializer
     permission_classes = [permissions.IsAuthenticated]
 
@@ -1444,95 +1311,752 @@ class SMSMessageViewSet(viewsets.ModelViewSet):
     )
     @action(detail=False, methods=['post'])
     def quick_send(self, request):
-        """
-        Send a single SMS message without creating a campaign
-        """
+        """Send a quick SMS message without creating a campaign"""
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        self.perform_create(serializer)
         
-        # Here you would implement the logic to send the message
-        # This is a placeholder
-        message = serializer.instance
-        message.status = 'sending'
-        message.save()
-        
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+        try:
+            # Add the current user
+            serializer.validated_data['user'] = request.user
+            
+            # Calculate message segments (for token deduction)
+            message_content = serializer.validated_data.get('content', '')
+            segments = max(1, len(message_content) // 160 + (1 if len(message_content) % 160 > 0 else 0))
+            serializer.validated_data['segments'] = segments
+            
+            # Check if user has enough tokens
+            user = request.user
+            if user.tokens_balance < segments:
+                return Response(
+                    {"detail": "Insufficient tokens. Please add tokens to your account."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Create the message
+            message = serializer.save(status='queued')
+            
+            # Use Celery to send the message asynchronously
+            from .tasks import send_single_sms
+            send_single_sms.delay(str(message.id))
+            
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+            
+        except Exception as e:
+            return Response(
+                {"detail": f"Error sending message: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    @swagger_auto_schema(
+        operation_description="Africa's Talking delivery report callback endpoint",
+        request_body=openapi.Schema(
+            type=openapi.TYPE_OBJECT,
+            properties={
+                'id': openapi.Schema(type=openapi.TYPE_STRING),
+                'phoneNumber': openapi.Schema(type=openapi.TYPE_STRING),
+                'status': openapi.Schema(type=openapi.TYPE_STRING),
+                'networkCode': openapi.Schema(type=openapi.TYPE_STRING),
+                'failureReason': openapi.Schema(type=openapi.TYPE_STRING, description='Reason for failure if status is Failed'),
+            }
+        ),
+        responses={
+            200: openapi.Response(
+                description="Callback processed successfully",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'status': openapi.Schema(type=openapi.TYPE_STRING),
+                    }
+                )
+            )
+        }
+    )
+    @action(detail=False, methods=['post'], permission_classes=[AllowAny], url_path='delivery-callback')
+    def delivery_callback(self, request):
+        """Handle delivery callbacks from Africa's Talking"""
+        try:
+            # Log the callback data for debugging
+            logger.info(f"Africa's Talking delivery callback received: {request.data}")
+            
+            # Get message ID from the callback
+            message_id = request.data.get('id')
+            phone_number = request.data.get('phoneNumber')
+            status = request.data.get('status')
+            failure_reason = request.data.get('failureReason')
+            
+            if not message_id or not status:
+                return Response({"status": "Missing required parameters"}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Map Africa's Talking status to our internal statuses
+            status_mapping = {
+                'Success': 'delivered',
+                'Sent': 'sent',
+                'Failed': 'failed',
+                'Rejected': 'rejected',
+                'Buffered': 'queued',
+            }
+            
+            internal_status = status_mapping.get(status, 'unknown')
+            
+            # Find the message with this message_id
+            try:
+                message = SMSMessage.objects.get(message_id=message_id)
+            except SMSMessage.DoesNotExist:
+                # Try to find message by recipient phone number if message_id doesn't match
+                if phone_number:
+                    messages = SMSMessage.objects.filter(
+                        recipient=phone_number,
+                        delivery_status__in=['pending', 'queued', 'sending', 'sent']
+                    ).order_by('-created_at')
+                    
+                    if messages.exists():
+                        message = messages.first()
+                    else:
+                        return Response({"status": "Message not found"}, status=status.HTTP_404_NOT_FOUND)
+                else:
+                    return Response({"status": "Message not found"}, status=status.HTTP_404_NOT_FOUND)
+            
+            # Update message delivery status
+            message.delivery_status = internal_status
+            
+            # If delivered, set delivery time
+            if internal_status == 'delivered' and not message.delivery_time:
+                message.delivery_time = timezone.now()
+            
+            # Add failure reason if available
+            if failure_reason:
+                message.error_message = failure_reason
+            
+            # Update metadata
+            message.metadata.update({
+                'callback_data': request.data,
+                'status_updated_at': timezone.now().isoformat()
+            })
+            
+            message.save(update_fields=[
+                'delivery_status', 
+                'delivery_time', 
+                'error_message', 
+                'metadata', 
+                'updated_at'
+            ])
+            
+            # Send webhook event for status update
+            from utils.webhooks import send_event_to_user_webhooks
+            
+            event_type = f"message.{internal_status}"
+            send_event_to_user_webhooks(
+                user_id=str(message.user.id),
+                event_type=event_type,
+                data={
+                    'message_id': str(message.id),
+                    'recipient': message.recipient,
+                    'status': message.status,
+                    'delivery_status': message.delivery_status,
+                    'campaign_id': str(message.campaign.id) if message.campaign else None,
+                    'delivered_at': message.delivery_time.isoformat() if message.delivery_time else None,
+                    'error': failure_reason if failure_reason else None
+                }
+            )
+            
+            return Response({"status": "Delivery status updated successfully"})
+            
+        except Exception as e:
+            logger.error(f"Error processing Africa's Talking delivery callback: {str(e)}")
+            return Response(
+                {"status": f"Error: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 
 class PaymentViewSet(viewsets.ModelViewSet):
     """
-    API endpoint that allows payments to be viewed or edited.
+    API endpoint that allows payments to be viewed or created.
     """
+    queryset = Payment.objects.all()
     serializer_class = PaymentSerializer
     permission_classes = [permissions.IsAuthenticated]
-
+    
     def get_queryset(self):
-        """
-        This view returns payments for the currently authenticated user.
-        """
+        """Return only the authenticated user's payments"""
         return Payment.objects.filter(user=self.request.user)
-
+    
     @swagger_auto_schema(
         operation_description="List all payments made by the authenticated user"
     )
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
-
+    
     @swagger_auto_schema(
-        operation_description="Create a new payment record"
+        operation_description="Create a new payment request",
+        request_body=openapi.Schema(
+            type=openapi.TYPE_OBJECT,
+            properties={
+                'amount': openapi.Schema(type=openapi.TYPE_NUMBER, description='Payment amount'),
+                'payment_method': openapi.Schema(type=openapi.TYPE_STRING, description='Payment method (mpesa)'),
+                'phone_number': openapi.Schema(type=openapi.TYPE_STRING, description='Phone number for M-Pesa'),
+            },
+            required=['amount', 'payment_method']
+        ),
+        responses={
+            201: openapi.Response(
+                description="Payment initiated",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'id': openapi.Schema(type=openapi.TYPE_STRING),
+                        'status': openapi.Schema(type=openapi.TYPE_STRING),
+                        'message': openapi.Schema(type=openapi.TYPE_STRING),
+                    }
+                )
+            ),
+            400: "Bad request"
+        }
     )
     def create(self, request, *args, **kwargs):
-        return super().create(request, *args, **kwargs)
+        """Create a new payment request"""
+        
+        # Validate required fields
+        amount = request.data.get('amount')
+        payment_method = request.data.get('payment_method', 'mpesa')
+        
+        if not amount:
+            return Response(
+                {"detail": "Amount is required."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        try:
+            amount = float(amount)
+            if amount <= 0:
+                return Response(
+                    {"detail": "Amount must be greater than zero."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        except (ValueError, TypeError):
+            return Response(
+                {"detail": "Invalid amount."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Create a payment record with pending status
+        payment = Payment.objects.create(
+            user=request.user,
+            amount=amount,
+            status='pending',
+            metadata={
+                'payment_method': payment_method,
+                'initiated_at': timezone.now().isoformat()
+            }
+        )
+        
+        # Handle M-Pesa payment
+        if payment_method.lower() == 'mpesa':
+            phone_number = request.data.get('phone_number')
+            
+            if not phone_number:
+                # Use user's phone number if not provided
+                phone_number = request.user.phone_number
+            
+            if not phone_number:
+                payment.status = 'failed'
+                payment.metadata.update({
+                    'error': 'Phone number is required for M-Pesa payments.',
+                    'failed_at': timezone.now().isoformat()
+                })
+                payment.save(update_fields=['status', 'metadata', 'updated_at'])
+                
+                return Response(
+                    {"detail": "Phone number is required for M-Pesa payments."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Initialize M-Pesa payment
+            from utils.mpesa import MPesaClient
+            mpesa = MPesaClient()
+            
+            account_reference = f"GDA-{request.user.id}"
+            transaction_desc = f"Payment for SMS tokens"
+            
+            result = mpesa.initiate_stk_push(
+                phone_number=phone_number,
+                amount=amount,
+                account_reference=account_reference,
+                transaction_desc=transaction_desc
+            )
+            
+            if result.get('status') == 'success':
+                # Update payment record with M-Pesa data
+                payment.metadata.update({
+                    'checkout_request_id': result.get('checkout_request_id'),
+                    'mpesa_response': result.get('response'),
+                    'stk_push_at': timezone.now().isoformat()
+                })
+                payment.save(update_fields=['metadata', 'updated_at'])
+                
+                # Add tokens to user's balance based on payment amount
+                # Simplified conversion: 1 KES = 1 token
+                tokens_to_add = int(payment.amount)
+                payment.user.tokens_balance += tokens_to_add
+                payment.user.save(update_fields=['tokens_balance'])
+                
+                payment.metadata.update({
+                    'tokens_added': tokens_to_add,
+                    'completed_at': timezone.now().isoformat()
+                })
+                
+                payment.save(update_fields=['status', 'payment_date', 'metadata', 'updated_at'])
+                
+                # Send webhook event for successful payment
+                from utils.webhooks import send_event_to_user_webhooks
+                send_event_to_user_webhooks(
+                    user_id=str(payment.user.id),
+                    event_type='payment.successful',
+                    data={
+                        'payment_id': str(payment.id),
+                        'amount': float(payment.amount),
+                        'tokens_added': tokens_to_add,
+                        'payment_method': payment.metadata.get('payment_method', 'mpesa'),
+                        'completed_at': timezone.now().isoformat()
+                    }
+                )
+                
+                return Response({
+                    'id': str(payment.id),
+                    'status': 'pending',
+                    'message': 'M-Pesa STK push sent. Please check your phone and enter PIN.',
+                    'checkout_request_id': result.get('checkout_request_id')
+                }, status=status.HTTP_201_CREATED)
+            else:
+                # Update payment record with error
+                payment.status = 'failed'
+                payment.metadata.update({
+                    'error': result.get('message'),
+                    'mpesa_response': result.get('response'),
+                    'failed_at': timezone.now().isoformat()
+                })
+                payment.save(update_fields=['status', 'metadata', 'updated_at'])
+                
+                return Response({
+                    'id': str(payment.id),
+                    'status': 'failed',
+                    'message': result.get('message')
+                }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Add other payment methods here as needed
+        
+        return Response({
+            'id': str(payment.id),
+            'status': 'pending',
+            'message': f'Payment initiated with {payment_method}.'
+        }, status=status.HTTP_201_CREATED)
+    
+    @swagger_auto_schema(
+        operation_description="Check the status of a payment",
+        responses={
+            200: openapi.Response(
+                description="Payment status",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'id': openapi.Schema(type=openapi.TYPE_STRING),
+                        'status': openapi.Schema(type=openapi.TYPE_STRING),
+                        'message': openapi.Schema(type=openapi.TYPE_STRING),
+                    }
+                )
+            ),
+            404: "Payment not found"
+        }
+    )
+    @action(detail=True, methods=['get'])
+    def check_status(self, request, pk=None):
+        """Check the status of a payment"""
+        try:
+            payment = self.get_object()
+            
+            # If payment is already completed or failed, just return the status
+            if payment.status in ['completed', 'failed', 'refunded']:
+                return Response({
+                    'id': str(payment.id),
+                    'status': payment.status,
+                    'message': f'Payment {payment.status}.'
+                })
+            
+            # For M-Pesa payments, check the status via API
+            if payment.metadata.get('payment_method') == 'mpesa' and payment.metadata.get('checkout_request_id'):
+                from utils.mpesa import MPesaClient
+                mpesa = MPesaClient()
+                
+                result = mpesa.query_stk_status(payment.metadata.get('checkout_request_id'))
+                
+                payment.metadata.update({
+                    'status_check_response': result,
+                    'status_checked_at': timezone.now().isoformat()
+                })
+                
+                if result.get('status') == 'success':
+                    mpesa_response = result.get('response', {})
+                    result_code = mpesa_response.get('ResultCode')
+                    result_desc = mpesa_response.get('ResultDesc', '')
+                    
+                    # Import webhook utility
+                    from utils.webhooks import send_event_to_user_webhooks
+                    
+                    if result_code == 0:
+                        # Payment successful
+                        payment.status = 'completed'
+                        payment.payment_date = timezone.now()
+                        
+                        # Add tokens to user's balance based on payment amount
+                        # Simplified conversion: 1 KES = 1 token
+                        tokens_to_add = int(payment.amount)
+                        payment.user.tokens_balance += tokens_to_add
+                        payment.user.save(update_fields=['tokens_balance'])
+                        
+                        payment.metadata.update({
+                            'tokens_added': tokens_to_add,
+                            'completed_at': timezone.now().isoformat(),
+                            'result_desc': result_desc
+                        })
+                        
+                        payment.save(update_fields=['status', 'payment_date', 'metadata', 'updated_at'])
+                        
+                        # Send webhook event for successful payment
+                        send_event_to_user_webhooks(
+                            user_id=str(payment.user.id),
+                            event_type='payment.successful',
+                            data={
+                                'payment_id': str(payment.id),
+                                'amount': float(payment.amount),
+                                'tokens_added': tokens_to_add,
+                                'payment_method': payment.metadata.get('payment_method', 'mpesa'),
+                                'completed_at': timezone.now().isoformat(),
+                                'result_desc': result_desc
+                            }
+                        )
+                        
+                        return Response({
+                            'id': str(payment.id),
+                            'status': 'completed',
+                            'message': 'Payment completed successfully.',
+                            'tokens_added': tokens_to_add
+                        })
+                    elif result_code == 1032:
+                        # Transaction cancelled by user
+                        payment.status = 'failed'
+                        payment.metadata.update({
+                            'error': 'Transaction was cancelled by the user.',
+                            'error_code': result_code,
+                            'cancelled_at': timezone.now().isoformat(),
+                            'result_desc': result_desc
+                        })
+                        payment.save(update_fields=['status', 'metadata', 'updated_at'])
+                        
+                        # Send webhook event for cancelled payment
+                        send_event_to_user_webhooks(
+                            user_id=str(payment.user.id),
+                            event_type='payment.cancelled',
+                            data={
+                                'payment_id': str(payment.id),
+                                'amount': float(payment.amount),
+                                'payment_method': payment.metadata.get('payment_method', 'mpesa'),
+                                'cancelled_at': timezone.now().isoformat(),
+                                'result_desc': result_desc,
+                                'error_code': result_code
+                            }
+                        )
+                        
+                        return Response({
+                            'id': str(payment.id),
+                            'status': 'cancelled',
+                            'message': 'Transaction was cancelled by the user.'
+                        })
+                    elif result_code == 1037:
+                        # Timeout 
+                        payment.status = 'failed'
+                        payment.metadata.update({
+                            'error': 'Transaction timed out.',
+                            'error_code': result_code,
+                            'failed_at': timezone.now().isoformat(),
+                            'result_desc': result_desc
+                        })
+                        payment.save(update_fields=['status', 'metadata', 'updated_at'])
+                        
+                        # Send webhook event for failed payment
+                        send_event_to_user_webhooks(
+                            user_id=str(payment.user.id),
+                            event_type='payment.failed',
+                            data={
+                                'payment_id': str(payment.id),
+                                'amount': float(payment.amount),
+                                'payment_method': payment.metadata.get('payment_method', 'mpesa'),
+                                'failed_at': timezone.now().isoformat(),
+                                'result_desc': result_desc,
+                                'error_code': result_code
+                            }
+                        )
+                        
+                        return Response({
+                            'id': str(payment.id),
+                            'status': 'failed',
+                            'message': 'Transaction timed out.'
+                        })
+                    else:
+                        # Other error
+                        payment.status = 'failed'
+                        payment.metadata.update({
+                            'error': result_desc,
+                            'error_code': result_code,
+                            'failed_at': timezone.now().isoformat()
+                        })
+                        payment.save(update_fields=['status', 'metadata', 'updated_at'])
+                        
+                        # Send webhook event for failed payment
+                        send_event_to_user_webhooks(
+                            user_id=str(payment.user.id),
+                            event_type='payment.failed',
+                            data={
+                                'payment_id': str(payment.id),
+                                'amount': float(payment.amount),
+                                'payment_method': payment.metadata.get('payment_method', 'mpesa'),
+                                'failed_at': timezone.now().isoformat(),
+                                'result_desc': result_desc,
+                                'error_code': result_code
+                            }
+                        )
+                        
+                        return Response({
+                            'id': str(payment.id),
+                            'status': 'failed',
+                            'message': result_desc
+                        })
+                
+            # For other payment methods or if status check fails
+            payment.save(update_fields=['metadata', 'updated_at'])
+            return Response({
+                'id': str(payment.id),
+                'status': payment.status,
+                'message': 'Payment status is still pending.'
+            })
+            
+        except Exception as e:
+            logger.error(f"Error checking payment status: {str(e)}")
+            return Response(
+                {"detail": f"Error checking payment status: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    @swagger_auto_schema(
+        operation_description="M-Pesa callback endpoint",
+        request_body=openapi.Schema(
+            type=openapi.TYPE_OBJECT,
+            properties={
+                'Body': openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'stkCallback': openapi.Schema(
+                            type=openapi.TYPE_OBJECT,
+                            properties={
+                                'MerchantRequestID': openapi.Schema(type=openapi.TYPE_STRING),
+                                'CheckoutRequestID': openapi.Schema(type=openapi.TYPE_STRING),
+                                'ResultCode': openapi.Schema(type=openapi.TYPE_INTEGER),
+                                'ResultDesc': openapi.Schema(type=openapi.TYPE_STRING),
+                            }
+                        )
+                    }
+                )
+            }
+        ),
+        responses={
+            200: openapi.Response(
+                description="Callback received",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'status': openapi.Schema(type=openapi.TYPE_STRING),
+                    }
+                )
+            )
+        }
+    )
+    @action(detail=False, methods=['post'], permission_classes=[AllowAny], url_path='callback')
+    def mpesa_callback(self, request):
+        """Handle M-Pesa callback"""
+        try:
+            # Log the callback data for debugging
+            logger.info(f"M-Pesa callback received: {request.data}")
+            
+            # Extract relevant data from the callback
+            callback_data = request.data.get('Body', {}).get('stkCallback', {})
+            checkout_request_id = callback_data.get('CheckoutRequestID')
+            result_code = callback_data.get('ResultCode')
+            result_desc = callback_data.get('ResultDesc')
+            
+            if not checkout_request_id:
+                return Response({"status": "Invalid callback data"}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Find the payment with this checkout_request_id
+            try:
+                payment = Payment.objects.get(metadata__checkout_request_id=checkout_request_id)
+            except Payment.DoesNotExist:
+                return Response({"status": "Payment not found"}, status=status.HTTP_404_NOT_FOUND)
+            
+            # Import webhook utility
+            from utils.webhooks import send_event_to_user_webhooks
+            
+            # Update payment based on result code
+            if result_code == 0:
+                # Payment successful
+                payment.status = 'completed'
+                payment.payment_date = timezone.now()
+                
+                # Add tokens to user's balance
+                tokens_to_add = int(payment.amount)  # Simplified: 1 KES = 1 token
+                payment.user.tokens_balance += tokens_to_add
+                payment.user.save(update_fields=['tokens_balance'])
+                
+                payment.metadata.update({
+                    'callback_data': callback_data,
+                    'tokens_added': tokens_to_add,
+                    'completed_at': timezone.now().isoformat()
+                })
+                
+                payment.save(update_fields=['status', 'payment_date', 'metadata', 'updated_at'])
+                
+                # Send webhook event for successful payment
+                send_event_to_user_webhooks(
+                    user_id=str(payment.user.id),
+                    event_type='payment.successful',
+                    data={
+                        'payment_id': str(payment.id),
+                        'amount': float(payment.amount),
+                        'tokens_added': tokens_to_add,
+                        'payment_method': payment.metadata.get('payment_method', 'mpesa'),
+                        'completed_at': timezone.now().isoformat(),
+                        'result_desc': result_desc
+                    }
+                )
+            
+            elif result_code == 1032:  
+                # Transaction cancelled by user
+                payment.status = 'failed'
+                payment.metadata.update({
+                    'callback_data': callback_data,
+                    'error': result_desc,
+                    'error_code': result_code,
+                    'cancelled_at': timezone.now().isoformat()
+                })
+                payment.save(update_fields=['status', 'metadata', 'updated_at'])
+                
+                # Send webhook event for cancelled payment
+                send_event_to_user_webhooks(
+                    user_id=str(payment.user.id),
+                    event_type='payment.cancelled',
+                    data={
+                        'payment_id': str(payment.id),
+                        'amount': float(payment.amount),
+                        'payment_method': payment.metadata.get('payment_method', 'mpesa'),
+                        'cancelled_at': timezone.now().isoformat(),
+                        'result_desc': result_desc,
+                        'error_code': result_code
+                    }
+                )
+            
+            else:
+                # Payment failed
+                payment.status = 'failed'
+                payment.metadata.update({
+                    'callback_data': callback_data,
+                    'error': result_desc,
+                    'error_code': result_code,
+                    'failed_at': timezone.now().isoformat()
+                })
+                payment.save(update_fields=['status', 'metadata', 'updated_at'])
+                
+                # Send webhook event for failed payment
+                send_event_to_user_webhooks(
+                    user_id=str(payment.user.id),
+                    event_type='payment.failed',
+                    data={
+                        'payment_id': str(payment.id),
+                        'amount': float(payment.amount),
+                        'payment_method': payment.metadata.get('payment_method', 'mpesa'),
+                        'failed_at': timezone.now().isoformat(),
+                        'result_desc': result_desc,
+                        'error_code': result_code
+                    }
+                )
+            
+            return Response({"status": "Callback processed successfully"})
+            
+        except Exception as e:
+            logger.error(f"Error processing M-Pesa callback: {str(e)}")
+            return Response(
+                {"status": f"Error: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
 
 
-class SMSTemplateViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows SMS templates to be viewed or edited.
-    """
-    serializer_class = SMSTemplateSerializer
-    permission_classes = [permissions.IsAuthenticated]
+class MessageTemplateViewSet(viewsets.ModelViewSet):
+    """ViewSet for managing message templates"""
+    serializer_class = MessageTemplateSerializer
+    queryset = MessageTemplate.objects.all()
+    template_service = TemplateVerificationService()
 
     def get_queryset(self):
-        """
-        This view returns templates for the currently authenticated user.
-        """
-        return SMSTemplate.objects.filter(user=self.request.user)
+        """Filter queryset for current user"""
+        return self.queryset.filter(user=self.request.user)
 
-    @swagger_auto_schema(
-        operation_description="List all SMS templates belonging to the authenticated user"
-    )
-    def list(self, request, *args, **kwargs):
-        return super().list(request, *args, **kwargs)
+    def perform_create(self, serializer):
+        """Create new template and verify content"""
+        template = serializer.save(user=self.request.user)
+        self.template_service.process_template(template)
 
-    @swagger_auto_schema(
-        operation_description="Create a new SMS template"
-    )
-    def create(self, request, *args, **kwargs):
-        return super().create(request, *args, **kwargs)
+    def perform_update(self, serializer):
+        """Update template and re-verify content"""
+        template = serializer.save()
+        self.template_service.process_template(template)
 
+    @action(detail=True, methods=['post'])
+    def verify(self, request, pk=None):
+        """Manually trigger template verification"""
+        template = self.get_object()
+        verified_template = self.template_service.process_template(template)
+        
+        return Response({
+            'status': verified_template.verification_status,
+            'rejection_reason': verified_template.rejection_reason,
+            'metadata': verified_template.metadata.get('verification_metadata', {})
+        })
 
-class WebhookEndpointViewSet(viewsets.ModelViewSet):
-    """
-    API endpoint that allows webhook endpoints to be viewed or edited.
-    """
-    serializer_class = WebhookEndpointSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    @action(detail=False, methods=['get'])
+    def categories(self, request):
+        """Get available template categories"""
+        return Response({
+            'categories': [
+                {'value': choice[0], 'label': choice[1]}
+                for choice in MessageTemplate.TemplateCategory.choices
+            ]
+        })
 
-    def get_queryset(self):
-        """
-        This view returns webhook endpoints for the currently authenticated user.
-        """
-        return WebhookEndpoint.objects.filter(user=self.request.user)
-
-    @swagger_auto_schema(
-        operation_description="List all webhook endpoints configured by the authenticated user"
-    )
-    def list(self, request, *args, **kwargs):
-        return super().list(request, *args, **kwargs)
-
-    @swagger_auto_schema(
-        operation_description="Create a new webhook endpoint"
-    )
-    def create(self, request, *args, **kwargs):
-        return super().create(request, *args, **kwargs)
+    @action(detail=False, methods=['get'])
+    def statistics(self, request):
+        """Get template usage statistics"""
+        templates = self.get_queryset()
+        
+        stats = {
+            'total_count': templates.count(),
+            'by_status': {
+                status: templates.filter(verification_status=status).count()
+                for status, _ in MessageTemplate.VerificationStatus.choices
+            },
+            'by_category': {
+                category: templates.filter(category=category).count()
+                for category, _ in MessageTemplate.TemplateCategory.choices
+            },
+            'most_used': templates.order_by('-usage_count')[:5].values(
+                'name', 'category', 'usage_count'
+            )
+        }
+        
+        return Response(stats)

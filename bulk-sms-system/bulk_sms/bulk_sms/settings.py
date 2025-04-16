@@ -16,6 +16,9 @@ from dotenv import load_dotenv
 from datetime import timedelta
 import dj_database_url
 
+# Load environment variables
+load_dotenv()
+
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -24,14 +27,13 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-from decouple import config
-SECRET_KEY = config('SECRET_KEY')
+SECRET_KEY = os.getenv('SECRET_KEY')
 
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DEBUG', 'False') == 'True'
 
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '').split(',')
 
 # AFRICASTALKING_USERNAME = os.getenv('AT_USERNAME')
 # AFRICASTALKING_API_KEY = os.getenv('AT_API_KEY')
@@ -53,8 +55,12 @@ INSTALLED_APPS = [
     'corsheaders',
     'drf_yasg',
     'django_filters',
+    # Celery apps
+    'django_celery_beat',
+    'django_celery_results',
     # Local apps
     'sms_api',
+    'token_management',
 ]
 
 MIDDLEWARE = [
@@ -72,41 +78,39 @@ CORS_ALLOW_CREDENTIALS = True  # Allow cookies to be sent cross-origin
 
 # CORS settings
 CORS_ALLOW_ALL_ORIGINS = False  # Set to True for development only
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:5173",  # React development server
-    # Add your production domains here
-]
+CORS_ALLOWED_ORIGINS = os.getenv('CORS_ALLOWED_ORIGINS', '').split(',')
 
-CSRF_TRUSTED_ORIGINS = [
-    "https://fb36-105-161-36-99.ngrok-free.app",
-    "https://1adf-105-161-204-170.ngrok-free.app",
-]
+CSRF_TRUSTED_ORIGINS = os.getenv('CSRF_TRUSTED_ORIGINS', '').split(',')
 
 # REST Framework settings
 REST_FRAMEWORK = {
-    # Add rate limiting
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'rest_framework_simplejwt.authentication.JWTAuthentication',
+    ),
+    'DEFAULT_PERMISSION_CLASSES': (
+        'rest_framework.permissions.IsAuthenticated',
+    ),
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 10,
+    'DEFAULT_FILTER_BACKENDS': (
+        'django_filters.rest_framework.DjangoFilterBackend',
+        'rest_framework.filters.SearchFilter',
+        'rest_framework.filters.OrderingFilter',
+    ),
     'DEFAULT_THROTTLE_CLASSES': [
         'rest_framework.throttling.AnonRateThrottle',
         'rest_framework.throttling.UserRateThrottle'
     ],
     'DEFAULT_THROTTLE_RATES': {
-        'anon': '5/minute',  # Limit anonymous users to 5 requests per minute
-        'user': '20/minute',  # Limit authenticated users to 20 requests per minute
-        'email_verification': '3/hour',  # Limit email verification requests
-    },
-
-    'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
-    ),
-    'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.IsAuthenticated',
-    ]
+        'anon': os.getenv('API_RATE_LIMIT', '100/minute'),
+        'user': os.getenv('SMS_RATE_LIMIT', '1000/hour')
+    }
 }
 
 
 SIMPLE_JWT = {
-    'ACCESS_TOKEN_LIFETIME': timedelta(hours=1),
-    'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=int(os.getenv('JWT_ACCESS_TOKEN_LIFETIME', 5))),
+    'REFRESH_TOKEN_LIFETIME': timedelta(days=int(os.getenv('JWT_REFRESH_TOKEN_LIFETIME', 1))),
     'ROTATE_REFRESH_TOKENS': True,
     'BLACKLIST_AFTER_ROTATION': True,
     'UPDATE_LAST_LOGIN': True,
@@ -150,28 +154,54 @@ LOGGING = {
             'style': '{',
         },
     },
+    'filters': {
+        'require_debug_false': {
+            '()': 'django.utils.log.RequireDebugFalse',
+        },
+        'require_debug_true': {
+            '()': 'django.utils.log.RequireDebugTrue',
+        },
+    },
     'handlers': {
         'console': {
-            'level': 'INFO',
+            'level': os.getenv('LOG_LEVEL', 'INFO'),
             'class': 'logging.StreamHandler',
             'formatter': 'verbose',
+            'filters': ['require_debug_true'],
         },
         'file': {
-            'level': 'INFO',
-            'class': 'logging.FileHandler',
-            'filename': 'logs/debug.log',
+            'level': os.getenv('LOG_LEVEL', 'INFO'),
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filename': os.path.join(BASE_DIR, 'logs', 'debug.log'),
+            'maxBytes': 1024 * 1024 * 5,  # 5 MB
+            'backupCount': 5,
             'formatter': 'verbose',
         },
+        'mail_admins': {
+            'level': 'ERROR',
+            'class': 'django.utils.log.AdminEmailHandler',
+            'filters': ['require_debug_false'],
+        }
     },
     'loggers': {
         'django': {
             'handlers': ['console', 'file'],
-            'level': 'INFO',
+            'level': os.getenv('LOG_LEVEL', 'INFO'),
             'propagate': True,
         },
-        'accounts': {
+        'django.request': {
+            'handlers': ['mail_admins', 'file'],
+            'level': 'ERROR',
+            'propagate': False,
+        },
+        'sms_api': {
             'handlers': ['console', 'file'],
-            'level': 'INFO',
+            'level': os.getenv('LOG_LEVEL', 'INFO'),
+            'propagate': True,
+        },
+        'token_management': {
+            'handlers': ['console', 'file'],
+            'level': os.getenv('LOG_LEVEL', 'INFO'),
             'propagate': True,
         },
     },
@@ -208,6 +238,18 @@ WSGI_APPLICATION = 'bulk_sms.wsgi.application'
 #     }
 # }
 
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.postgresql',
+#         'NAME': os.getenv('DB_NAME'),
+#         'USER': os.getenv('DB_USER'),
+#         'PASSWORD': os.getenv('DB_PASSWORD'),
+#         'HOST': os.getenv('DB_HOST'),
+#         'PORT': os.getenv('DB_PORT'),
+#     }
+# }
+
+
 DATABASES = {
     "default": dj_database_url.parse(
         "postgresql://postgres:szhgMuQeAFWCEwINwlIlfvVOrtmwdWUe@switchyard.proxy.rlwy.net:25669/railway", conn_max_age=600, ssl_require=True
@@ -239,7 +281,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = 'Africa/Nairobi'
 
 USE_I18N = True
 
@@ -252,6 +294,9 @@ USE_TZ = True
 # In settings.py
 STATIC_URL = 'static/'
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
+
+MEDIA_URL = 'media/'
+MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
@@ -287,3 +332,120 @@ class EmailVerificationRateThrottle(AnonRateThrottle):
 # Secure cookies settings
 CSRF_COOKIE_SECURE = True  # Use HTTPS for CSRF cookies
 SESSION_COOKIE_SECURE = True  # Use HTTPS for session cookies
+
+# Celery Configuration
+CELERY_BROKER_URL = f"redis://{os.getenv('REDIS_HOST')}:{os.getenv('REDIS_PORT')}/1"
+CELERY_RESULT_BACKEND = f"redis://{os.getenv('REDIS_HOST')}:{os.getenv('REDIS_PORT')}/1"
+CELERY_ACCEPT_CONTENT = ['json']
+CELERY_TASK_SERIALIZER = 'json'
+CELERY_RESULT_SERIALIZER = 'json'
+CELERY_TIMEZONE = TIME_ZONE
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = 30 * 60
+
+# Redis cache configuration
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': f"redis://{os.getenv('REDIS_HOST')}:{os.getenv('REDIS_PORT')}/{os.getenv('REDIS_DB')}",
+        'OPTIONS': {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+        }
+    }
+}
+
+# Configure session to use the cache
+SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
+SESSION_CACHE_ALIAS = 'default'
+
+# SMS Gateway Configuration
+SMS_GATEWAY_PROVIDER = os.getenv('SMS_GATEWAY_PROVIDER', 'africastalking')
+DEFAULT_SENDER_ID = os.getenv('DEFAULT_SENDER_ID', 'GDA')
+AFRICASTALKING_USERNAME = os.getenv('AT_USERNAME', 'sandbox')
+AFRICASTALKING_API_KEY = os.getenv('AT_API_KEY', 'atsk_d1c4ebc40df7664bc0286fe4cb6c146fba4614e4d27e066bf8422ed4251ff2eea1e005cc')
+AFRICASTALKING_SENDER_ID = os.getenv('AT_SENDER_ID', 'AFRICASTKNG')
+
+# Twilio configuration
+TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID', '')
+TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN', '') 
+TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER', '')
+
+# Frontend URL for links in emails
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:5173')
+
+# Email configuration for sending emails
+EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', 'noreply@godigitalafrica.com')
+EMAIL_HOST = os.getenv('EMAIL_HOST', 'smtp.sendgrid.net')
+EMAIL_PORT = int(os.getenv('EMAIL_PORT', 587))
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', 'apikey')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
+EMAIL_USE_TLS = os.getenv('EMAIL_USE_TLS', 'True') == 'True'
+
+# M-Pesa Daraja API configuration
+MPESA_CONSUMER_KEY = os.getenv('MPESA_CONSUMER_KEY', '')
+MPESA_CONSUMER_SECRET = os.getenv('MPESA_CONSUMER_SECRET', '')
+MPESA_SHORTCODE = os.getenv('MPESA_SHORTCODE', '174379')  # Default sandbox shortcode
+MPESA_PASSKEY = os.getenv('MPESA_PASSKEY', 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919')  # Default sandbox passkey
+MPESA_CALLBACK_URL = os.getenv('MPESA_CALLBACK_URL', f"{FRONTEND_URL}/api/v1/payments/callback/")
+
+# Celery Beat schedule
+CELERY_BEAT_SCHEDULE = {
+    'update-campaign-statuses': {
+        'task': 'sms_api.tasks.update_campaign_statuses',
+        'schedule': 60.0,  # Every 60 seconds
+    },
+    'process-scheduled-campaigns': {
+        'task': 'sms_api.tasks.process_scheduled_campaigns',
+        'schedule': 60.0,  # Every 60 seconds
+    },
+}
+
+# Security Settings
+if not DEBUG:
+    SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'False') == 'True'
+    SESSION_COOKIE_SECURE = os.getenv('SESSION_COOKIE_SECURE', 'False') == 'True'
+    CSRF_COOKIE_SECURE = os.getenv('CSRF_COOKIE_SECURE', 'False') == 'True'
+    SECURE_BROWSER_XSS_FILTER = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+
+# Africa's Talking Configuration
+AT_CONFIG = {
+    'username': os.getenv('AT_USERNAME'),
+    'api_key': os.getenv('AT_API_KEY'),
+    'environment': os.getenv('AT_ENVIRONMENT', 'sandbox'),
+    'sender_id': os.getenv('AT_SENDER_ID', 'BULKSMS'),
+}
+
+# M-Pesa Configuration
+MPESA_CONFIG = {
+    'consumer_key': os.getenv('MPESA_CONSUMER_KEY'),
+    'consumer_secret': os.getenv('MPESA_CONSUMER_SECRET'),
+    'passkey': os.getenv('MPESA_PASSKEY'),
+    'shortcode': os.getenv('MPESA_SHORTCODE'),
+    'callback_url': os.getenv('MPESA_CALLBACK_URL'),
+}
+
+# Webhook Configuration
+WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET')
+
+# NLP Services Configuration
+NLP_CONFIG = {
+    'spacy_model': os.getenv('SPACY_MODEL', 'en_core_web_sm'),
+    'profanity_check_enabled': os.getenv('PROFANITY_CHECK_ENABLED', 'True') == 'True',
+    'sentiment_analysis_enabled': os.getenv('SENTIMENT_ANALYSIS_ENABLED', 'True') == 'True',
+}
+
+# Swagger Settings
+SWAGGER_SETTINGS = {
+    'SECURITY_DEFINITIONS': {
+        'Bearer': {
+            'type': 'apiKey',
+            'name': 'Authorization',
+            'in': 'header'
+        }
+    },
+    'USE_SESSION_AUTH': False,
+    'JSON_EDITOR': True,
+    'SUPPORTED_SUBMIT_METHODS': ['get', 'post', 'put', 'delete', 'patch'],
+}

@@ -5,7 +5,7 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
     RegisterView, EmailVerificationRequestView, EmailVerificationConfirmView, UserViewSet, 
-    ContactGroupViewSet, ContactViewSet, SMSCampaignViewSet,
+    ContactGroupViewSet, ContactViewSet, CampaignViewSet,
     SMSMessageViewSet, PaymentViewSet, SMSTemplateViewSet, WebhookEndpointViewSet,
     CustomTokenObtainPairView, RegisterView, LoginView, LogoutView, ChangePasswordView, 
     ResetPasswordRequestView, ResetPasswordConfirmView, UserProfileView
@@ -16,11 +16,13 @@ router = DefaultRouter()
 router.register(r'users', UserViewSet)
 router.register(r'groups', ContactGroupViewSet, basename='group')
 router.register(r'contacts', ContactViewSet, basename='contact')
-router.register(r'campaigns', SMSCampaignViewSet, basename='campaign')
+router.register(r'campaigns', CampaignViewSet, basename='campaign')
 router.register(r'messages', SMSMessageViewSet, basename='message')
 router.register(r'payments', PaymentViewSet, basename='payment')
 router.register(r'templates', SMSTemplateViewSet, basename='template')
 router.register(r'webhooks', WebhookEndpointViewSet, basename='webhook')
+router.register(r'sms-templates', SMSTemplateViewSet)
+router.register(r'sms-messages', SMSMessageViewSet)
 
 urlpatterns = [
     # Include all routes from the router
@@ -43,4 +45,7 @@ urlpatterns = [
     
     # User profile
     path('profile/', UserProfileView.as_view(), name='profile'),
+    
+    # Custom callback URLs
+    path('callbacks/delivery-reports/', SMSMessageViewSet.as_view({'post': 'delivery_callback'}), name='africas-talking-callback'),
 ]
